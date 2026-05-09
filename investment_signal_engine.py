@@ -214,10 +214,12 @@ class InvestmentSignalEngine:
             
             # Also calculate pure USD percentiles for DCA decisions
             usd_percentiles = _self.compute_usd_percentiles()
+            usd_percentile_source = 'usd'
             if usd_percentiles is None:
-                logger.error("Failed to compute USD percentiles, falling back to gold ratios")
+                logger.error("Failed to compute USD percentiles, falling back to gold ratios — DCA tab will show gold-ratio percentiles")
                 btc_usd_percentile = btc_gold_percentile
                 eth_usd_percentile = eth_gold_percentile
+                usd_percentile_source = 'gold_ratio_fallback'  # Propagated to result for UI warning
             else:
                 btc_usd_percentile = usd_percentiles['btc_usd_percentile']
                 eth_usd_percentile = usd_percentiles['eth_usd_percentile']
@@ -268,7 +270,9 @@ class InvestmentSignalEngine:
                 # Silver freshness information
                 'silver_timestamp': silver_ts,
                 'silver_age_hours': silver_age,
-                'silver_fresh': silver_fresh
+                'silver_fresh': silver_fresh,
+                # USD percentile data source — 'usd' normally, 'gold_ratio_fallback' if USD fetch failed
+                'usd_percentile_source': usd_percentile_source
             }
             disk_cache.save('relative_valuation', result)
             return result
@@ -384,25 +388,29 @@ class InvestmentSignalEngine:
         return base_signal
     
     def _percentile_to_signal(self, percentile):
-        """Convert percentile rank to -5 to +5 signal scale"""
+        """
+        Convert percentile rank to -5 to +5 signal scale.
+        Fair value band is symmetric: 40-60% = signal 0.
+        Weighted signal uses 40% BTC / 60% ETH throughout.
+        """
         if percentile >= 95:
-            signal = 5  # Extremely overvalued (95%+ percentile)
+            signal = 5   # Extremely overvalued (95%+)
         elif percentile >= 85:
-            signal = 4  # Very overvalued (85-94%)
-        elif percentile >= 70:
-            signal = 3  # Overvalued (70-84%)
+            signal = 4   # Very overvalued (85-94%)
+        elif percentile >= 75:
+            signal = 3   # Overvalued (75-84%)
+        elif percentile >= 65:
+            signal = 2   # Moderately overvalued (65-74%)
         elif percentile >= 60:
-            signal = 2  # Moderately overvalued (60-69%)
-        elif percentile >= 55:
-            signal = 1  # Slightly overvalued (55-59%)
-        elif percentile >= 45:
-            signal = 0  # Fair value (45-54%)
+            signal = 1   # Slightly overvalued (60-64%)
         elif percentile >= 40:
-            signal = -1  # Slightly undervalued (40-44%)
-        elif percentile >= 30:
-            signal = -2  # Moderately undervalued (30-39%)
+            signal = 0   # Fair value (40-59%) — symmetric 20pt window
+        elif percentile >= 35:
+            signal = -1  # Slightly undervalued (35-39%)
+        elif percentile >= 25:
+            signal = -2  # Moderately undervalued (25-34%)
         elif percentile >= 15:
-            signal = -3  # Undervalued (15-29%)
+            signal = -3  # Undervalued (15-24%)
         elif percentile >= 5:
             signal = -4  # Very undervalued (5-14%)
         else:
@@ -420,8 +428,8 @@ class InvestmentSignalEngine:
         btc_signal = signals['btc_signal']
         eth_signal = signals['eth_signal']
         
-        # Determine primary action with weighted signal (30% BTC, 70% ETH)
-        avg_signal = (0.3 * btc_signal + 0.7 * eth_signal)
+        # Determine primary action with weighted signal (40% BTC, 60% ETH)
+        avg_signal = (0.4 * btc_signal + 0.6 * eth_signal)
         
         # Require BOTH assets to be in extreme territory for profit-taking
         both_extreme = btc_signal >= 4 and eth_signal >= 4
@@ -479,7 +487,7 @@ class InvestmentSignalEngine:
         else:
             return "LOW"
     
-    def get_position_sizing_recommendation(self, base_dca_amount=555, use_kelly=True, enhanced_settings=None):
+    def get_position_sizing_recommendation(self, base_dca_amount=777, use_kelly=True, enhanced_settings=None):
         """
         Calculate recommended DCA amount based on signals using enhanced DCA or traditional logic
         """
@@ -547,47 +555,30 @@ class InvestmentSignalEngine:
             btc_alloc = next(a for a in allocations if a['asset'] == 'BTC')
             eth_alloc = next(a for a in allocations if a['asset'] == 'ETH')
             
-            # Convert monthly to weekly and apply signal multiplier
-            btc_weekly = (btc_alloc['usd'] / 30 * 7) * weekly_multiplier
-            eth_weekly = (eth_alloc['usd'] / 30 * 7) * weekly_multiplier
-            
-            return {
-                'base_amount': base_weekly_amount,
-                'multiplier': weekly_multiplier,
-                'recommended_amount': total_weekly_amount,
-                'btc_allocation': btc_weekly,
-                'eth_allocation': eth_weekly,
-                'btc_weight': btc_alloc['weight'],
-                'eth_weight': eth_alloc['weight'],
-                'action': recommendation['primary_action'],
-                'action_note': f"Enhanced DCA: {dca_advice['rationale_summary']}",
-                'method': f'enhanced_dca_{dca_advice["mode_used"]}',
-                'enhanced_details': {
-                    'mode_used': dca_advice['mode_used'],
-                    'month': dca_advice['month'],
-                    'monthly_spend': dca_advice['month_spend_usd'],
-                    'data_quality': enhanced_advice['statistics']['data_sufficiency']
-                }
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Enhanced DCA calculation failed: {e}")
-            return None
+            # Convert monthly to weekly (exact: 7/30) and apply signal multiplier
+            btc_weekly = (btc_alloc['usd'] * 7 / 30) * weekly_multiplier
+            eth_weekly = (eth_alloc['usd'] * 7 / 30) * weekly_multiplier
     
     def _get_signal_multiplier(self, signal):
-        """Get DCA multiplier based on market signal"""
+        """
+        Full Kelly-aligned DCA multiplier. No artificial floor — Kelly math
+        determines sizing in both directions. 1/8 Kelly cap applied in
+        KellyPositionSizer prevents extreme cuts. $777 is the base weekly amount.
+        """
         if signal <= -4:
-            return 2.5  # Extreme accumulation
+            return 2.5   # Extreme accumulation
         elif signal <= -2:
-            return 1.7  # Strong increase
+            return 1.7   # Strong increase
         elif signal <= -1:
-            return 1.3  # Increase DCA
-        elif signal >= 4:
-            return 0.1  # Extreme top - minimal DCA
-        elif signal >= 2:
-            return 0.5  # Overvalued - reduced DCA
+            return 1.3   # Increase DCA
+        elif signal < 1:
+            return 1.0   # Fair value — baseline
+        elif signal < 2:
+            return 0.8   # Slightly overvalued — modest reduction
+        elif signal < 4:
+            return 0.5   # Overvalued — meaningful reduction
         else:
-            return 1.0  # Normal DCA
+            return 0.1   # Extreme top — near-zero, Kelly says don't bet
     
     def _get_enhanced_dca_sizing_session(self, base_weekly_amount, recommendation, enhanced_settings):
         """
@@ -647,9 +638,9 @@ class InvestmentSignalEngine:
             btc_alloc = next(a for a in allocations if a['asset'] == 'BTC')
             eth_alloc = next(a for a in allocations if a['asset'] == 'ETH')
             
-            # Convert monthly to weekly and apply signal multiplier
-            btc_weekly = (btc_alloc['usd'] / 30 * 7) * weekly_multiplier
-            eth_weekly = (eth_alloc['usd'] / 30 * 7) * weekly_multiplier
+            # Convert monthly to weekly (exact: 7/30) and apply signal multiplier
+            btc_weekly = (btc_alloc['usd'] * 7 / 30) * weekly_multiplier
+            eth_weekly = (eth_alloc['usd'] * 7 / 30) * weekly_multiplier
             
             return {
                 'base_amount': base_weekly_amount,
@@ -723,33 +714,36 @@ class InvestmentSignalEngine:
     
     def _get_traditional_sizing(self, base_dca_amount, recommendation):
         """
-        Traditional heuristic-based position sizing (fallback)
+        Signal-based position sizing fallback (used when Kelly calculation fails).
+        Full Kelly philosophy: sizing moves in both directions based on signal.
+        Base weekly amount: $777.
         """
         signal = recommendation['combined_signal']
-        
-        # Multiplier based on signal strength - BASELINE DCA NEVER REDUCED
-        # Only scale up DCA when market conditions are optimal
-        if recommendation['primary_action'] == 'TAKE_PROFITS':
-            multiplier = 1.0  # Maintain baseline DCA even during profit-taking
-            action_note = "Maintain baseline DCA, consider profit-taking from existing holdings"
-        elif signal >= 2:
-            multiplier = 1.0  # Maintain baseline DCA during overvalued periods
-            action_note = "Maintain baseline DCA, market overvalued"
-        elif signal >= -1:
-            multiplier = 1.0  # Normal baseline DCA
-            action_note = "Maintain baseline DCA"
-        elif signal >= -2:
-            multiplier = 1.3  # Modest increase for undervalued conditions
-            action_note = "Increase DCA 30% - favorable conditions"
-        elif signal >= -3:
-            multiplier = 1.7  # Solid increase for very undervalued
-            action_note = "Increase DCA 70% - strong buying opportunity"
+
+        if signal <= -4:
+            multiplier = 2.5
+            action_note = "Increase DCA 150% — extreme accumulation opportunity"
+        elif signal <= -2:
+            multiplier = 1.7
+            action_note = "Increase DCA 70% — strong buying opportunity"
+        elif signal <= -1:
+            multiplier = 1.3
+            action_note = "Increase DCA 30% — favorable conditions"
+        elif signal < 1:
+            multiplier = 1.0
+            action_note = "Maintain baseline DCA — fair value"
+        elif signal < 2:
+            multiplier = 0.8
+            action_note = "Reduce DCA 20% — slightly overvalued"
+        elif signal < 4:
+            multiplier = 0.5
+            action_note = "Reduce DCA 50% — overvalued conditions"
         else:
-            multiplier = 2.5  # Maximum increase for extreme undervaluation
-            action_note = "Increase DCA 150% - extreme buying opportunity"
-            
+            multiplier = 0.1
+            action_note = "Minimal DCA — extreme top signal"
+
         recommended_amount = base_dca_amount * multiplier
-        
+
         return {
             'base_amount': base_dca_amount,
             'multiplier': multiplier,
