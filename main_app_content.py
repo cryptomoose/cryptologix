@@ -33,6 +33,15 @@ def render_crypto_app():
             border-left: 5px solid;
             margin: 1rem 0;
         }
+        .metric-value-white [data-testid="stMetricValue"] {
+            color: #FFFFFF !important;
+        }
+        [data-testid="stMetricValue"] {
+            color: #FFFFFF !important;
+        }
+        [data-testid="stMetricLabel"] {
+            color: #FAFAFA !important;
+        }
         .rotation-badge {
             display: inline-block;
             padding: 0.5rem 1rem;
