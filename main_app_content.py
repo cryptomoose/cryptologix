@@ -12,6 +12,7 @@ from overview_content import render_overview_tab
 from long_term_data_fetcher import LongTermDataFetcher
 from eth_fundamentals import ETHFundamentals
 import disk_cache
+import rotation_log as rlog
 
 def render_crypto_app():
     """Render the main crypto analysis application"""
@@ -438,10 +439,10 @@ def render_crypto_app():
     # ── TAB 4: ROTATION LOG ────────────────────────────────────────────────────
     with tab4:
         st.markdown("## 🔁 Rotation Log")
-        
-        # Execute Rotation + Record DCA — merged here
+
+        # ── Actions ───────────────────────────────────────────────────────────
         action_col1, action_col2 = st.columns(2)
-        
+
         with action_col1:
             st.markdown("### ⚡ Execute Rotation")
             if st.button("🔄 Execute Rotation", use_container_width=True):
@@ -452,11 +453,19 @@ def render_crypto_app():
                         gold_pct=recommendation.gold_rotation_pct,
                         silver_pct=recommendation.silver_rotation_pct
                     )
+                    rlog.log_rotation(
+                        rotation_direction=recommendation.rotation_direction,
+                        rotation_pct=recommendation.rotation_percentage,
+                        total_usd=recommendation.rotation_percentage / 100 * st.session_state.base_weekly_dca,
+                        signals=signals,
+                        live_prices=live_prices,
+                        cycle_phase=recommendation.cycle_phase.value,
+                    )
                     st.success(f"✅ Rotated {recommendation.rotation_direction}")
                     st.rerun()
                 else:
                     st.info("No rotation recommended this week")
-        
+
         with action_col2:
             st.markdown("### 💵 Record DCA")
             if st.button("💵 Record DCA", use_container_width=True):
@@ -465,16 +474,143 @@ def render_crypto_app():
                         btc_amount=recommendation.btc_amount_usd,
                         eth_amount=recommendation.eth_amount_usd
                     )
-                    st.success(f"✅ Recorded ${recommendation.dca_amount_usd:,.2f} DCA")
+                    total = recommendation.btc_amount_usd + recommendation.eth_amount_usd
+                    multiplier = total / st.session_state.base_weekly_dca if st.session_state.base_weekly_dca else 1.0
+                    rlog.log_dca(
+                        btc_amount_usd=recommendation.btc_amount_usd,
+                        eth_amount_usd=recommendation.eth_amount_usd,
+                        multiplier=multiplier,
+                        signals=signals,
+                        live_prices=live_prices,
+                        cycle_phase=recommendation.cycle_phase.value,
+                    )
+                    st.success(f"✅ Recorded ${total:,.2f} DCA")
                     st.rerun()
                 else:
                     st.info("No DCA recommended this week")
-        
+
         st.markdown("---")
-        
-        # Rotation log persistence placeholder (Google Sheets integration — next sprint)
-        st.markdown("### 📋 History")
-        st.info("🔧 Rotation log persistence via Google Sheets coming next sprint.")
+
+        # ── Load log ──────────────────────────────────────────────────────────
+        entries = rlog.load_log()
+        stats = rlog.get_summary_stats(entries)
+
+        # ── Summary metrics ───────────────────────────────────────────────────
+        st.markdown("### 📊 Summary")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("DCA Entries", stats['total_dca_entries'])
+        m2.metric("Rotations", stats['total_rotation_entries'])
+        m3.metric("Total Deployed", f"${stats['total_deployed_usd']:,.0f}")
+        m4.metric("Avg BTC %ile at DCA",
+                  f"{stats['avg_btc_percentile_at_dca']:.1f}th" if stats['avg_btc_percentile_at_dca'] is not None else "—")
+        m5.metric("Avg ETH %ile at DCA",
+                  f"{stats['avg_eth_percentile_at_dca']:.1f}th" if stats['avg_eth_percentile_at_dca'] is not None else "—")
+
+        st.markdown("---")
+
+        if entries:
+            df = pd.DataFrame(entries)
+
+            # ── Charts ────────────────────────────────────────────────────────
+            st.markdown("### 📈 Charts")
+
+            dca_entries = df[df['entry_type'] == 'DCA'].copy()
+
+            if not dca_entries.empty:
+                dca_entries['timestamp'] = pd.to_datetime(dca_entries['timestamp'])
+                dca_entries['total_usd'] = pd.to_numeric(dca_entries['total_usd'], errors='coerce').fillna(0)
+                dca_entries['btc_amount_usd'] = pd.to_numeric(dca_entries['btc_amount_usd'], errors='coerce').fillna(0)
+                dca_entries['eth_amount_usd'] = pd.to_numeric(dca_entries['eth_amount_usd'], errors='coerce').fillna(0)
+                dca_entries['btc_percentile'] = pd.to_numeric(dca_entries['btc_percentile'], errors='coerce')
+                dca_entries['eth_percentile'] = pd.to_numeric(dca_entries['eth_percentile'], errors='coerce')
+
+                # Cumulative DCA deployed
+                dca_entries['cumulative_usd'] = dca_entries['total_usd'].cumsum()
+
+                chart_col1, chart_col2 = st.columns(2)
+
+                with chart_col1:
+                    st.markdown("**Cumulative DCA Deployed ($)**")
+                    st.area_chart(
+                        dca_entries.set_index('timestamp')['cumulative_usd'],
+                        color='#00D9FF'
+                    )
+
+                with chart_col2:
+                    st.markdown("**BTC vs ETH Allocation per Entry ($)**")
+                    alloc_df = dca_entries.set_index('timestamp')[['btc_amount_usd', 'eth_amount_usd']]
+                    alloc_df.columns = ['BTC', 'ETH']
+                    st.bar_chart(alloc_df, color=['#f7931a', '#627eea'])
+
+                # Signal percentiles at DCA entries
+                if dca_entries['btc_percentile'].notna().any():
+                    st.markdown("**Signal Percentiles at Each DCA Entry**")
+                    pct_df = dca_entries.set_index('timestamp')[['btc_percentile', 'eth_percentile']].dropna()
+                    pct_df.columns = ['BTC %ile', 'ETH %ile']
+                    st.line_chart(pct_df, color=['#f7931a', '#627eea'])
+                    st.caption("Lower = more undervalued at time of purchase. Good DCA entries cluster below 40th percentile.")
+
+            # Rotation markers
+            rotation_entries = df[df['entry_type'] == 'ROTATION']
+            if not rotation_entries.empty:
+                st.markdown("**Rotation Events**")
+                rot_display = rotation_entries[['timestamp', 'rotation_direction', 'rotation_pct',
+                                                'btc_percentile', 'eth_percentile', 'cycle_phase']].copy()
+                rot_display.columns = ['Date', 'Direction', 'Pct Rotated', 'BTC %ile', 'ETH %ile', 'Phase']
+                st.dataframe(rot_display, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # ── Full log table ────────────────────────────────────────────────
+            st.markdown("### 📋 Full History")
+
+            # Type filter
+            filter_type = st.selectbox("Filter by type", ["All", "DCA", "ROTATION"], index=0)
+            display_df = df if filter_type == "All" else df[df['entry_type'] == filter_type]
+
+            # Format for display
+            display_cols = ['timestamp', 'entry_type', 'total_usd', 'btc_amount_usd', 'eth_amount_usd',
+                            'multiplier', 'rotation_direction', 'rotation_pct',
+                            'btc_percentile', 'eth_percentile', 'btc_signal', 'eth_signal',
+                            'btc_price', 'eth_price', 'cycle_phase', 'notes']
+            st.dataframe(
+                display_df[display_cols].rename(columns={
+                    'timestamp': 'Date',
+                    'entry_type': 'Type',
+                    'total_usd': 'Total $',
+                    'btc_amount_usd': 'BTC $',
+                    'eth_amount_usd': 'ETH $',
+                    'multiplier': 'Mult',
+                    'rotation_direction': 'Direction',
+                    'rotation_pct': 'Rot %',
+                    'btc_percentile': 'BTC %ile',
+                    'eth_percentile': 'ETH %ile',
+                    'btc_signal': 'BTC Sig',
+                    'eth_signal': 'ETH Sig',
+                    'btc_price': 'BTC Price',
+                    'eth_price': 'ETH Price',
+                    'cycle_phase': 'Phase',
+                    'notes': 'Notes',
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+            st.info("No entries yet. Use the buttons above to record your first DCA or rotation.")
+
+        st.markdown("---")
+
+        # ── Download ──────────────────────────────────────────────────────────
+        st.markdown("### 💾 Export")
+        csv_bytes = rlog.get_log_csv_bytes()
+        st.download_button(
+            label="⬇️ Download CSV",
+            data=csv_bytes,
+            file_name=f"cryptologix_log_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime='text/csv',
+            help="Download full log as CSV for local backup"
+        )
 
     # ── TAB 0: OVERVIEW ────────────────────────────────────────────────────────
     with tab0:
