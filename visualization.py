@@ -13,9 +13,9 @@ class ChartVisualizer:
             'bull': '#26a69a',  # Green
             'bear': '#ef5350',  # Red
             'neutral': '#ffa726',  # Orange
-            'background': '#ffffff',
-            'grid': '#e0e0e0',
-            'text': '#333333'
+            'background': 'rgba(14,17,23,1)',
+            'grid': '#2d2d2d',
+            'text': '#FAFAFA'
         }
     
     def create_main_chart(self, df: pd.DataFrame, crypto_name: str, cycles: List[Dict]) -> go.Figure:
@@ -197,6 +197,11 @@ class ChartVisualizer:
         fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
         fig.update_yaxes(title_text="MACD", row=3, col=1)
         fig.update_yaxes(title_text="Volume", row=4, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        fig.update_yaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        for i in fig.layout:
+            if i.startswith('xaxis') or i.startswith('yaxis'):
+                fig.layout[i].update(bgcolor='rgba(14,17,23,1)')
         
         return fig
     
@@ -221,7 +226,7 @@ class ChartVisualizer:
                 y=df['Close'],
                 mode='lines',
                 name='Price',
-                line=dict(color='black', width=2)
+                line=dict(color='#FAFAFA', width=2)
             )
         )
         
@@ -501,7 +506,7 @@ class ChartVisualizer:
                 y=df['Close'],
                 mode='lines',
                 name='Price',
-                line=dict(color='black'),
+                line=dict(color='#FAFAFA'),
                 yaxis='y'
             ),
             row=1, col=1
@@ -552,6 +557,12 @@ class ChartVisualizer:
             yaxis2=dict(title='Volume', side='right', overlaying='y'),
             showlegend=True
         )
+
+        fig.update_xaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        fig.update_yaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        for i in fig.layout:
+            if i.startswith('xaxis') or i.startswith('yaxis'):
+                fig.layout[i].update(bgcolor='rgba(14,17,23,1)')
         
         return fig
     
@@ -607,5 +618,10 @@ class ChartVisualizer:
         
         fig.update_yaxes(title_text="Volatility (%)", row=1, col=1)
         fig.update_yaxes(title_text="VaR (%)", row=2, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        fig.update_yaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        for i in fig.layout:
+            if i.startswith('xaxis') or i.startswith('yaxis'):
+                fig.layout[i].update(bgcolor='rgba(14,17,23,1)')
         
         return fig
