@@ -558,7 +558,30 @@ class InvestmentSignalEngine:
             # Convert monthly to weekly (exact: 7/30) and apply signal multiplier
             btc_weekly = (btc_alloc['usd'] * 7 / 30) * weekly_multiplier
             eth_weekly = (eth_alloc['usd'] * 7 / 30) * weekly_multiplier
-    
+
+            return {
+                'base_amount': base_weekly_amount,
+                'multiplier': weekly_multiplier,
+                'recommended_amount': total_weekly_amount,
+                'btc_allocation': btc_weekly,
+                'eth_allocation': eth_weekly,
+                'btc_weight': btc_alloc['weight'],
+                'eth_weight': eth_alloc['weight'],
+                'action': recommendation['primary_action'],
+                'action_note': f"Enhanced DCA: {dca_advice['rationale_summary']}",
+                'method': f'enhanced_dca_{dca_advice["mode_used"]}',
+                'enhanced_details': {
+                    'mode_used': dca_advice['mode_used'],
+                    'month': dca_advice['month'],
+                    'monthly_spend': dca_advice['month_spend_usd'],
+                    'data_quality': enhanced_advice['statistics']['data_sufficiency']
+                }
+            }
+
+        except Exception as e:
+            self.logger.error(f"Enhanced DCA calculation failed: {e}")
+            return None
+
     def _get_signal_multiplier(self, signal):
         """
         Full Kelly-aligned DCA multiplier. No artificial floor — Kelly math
