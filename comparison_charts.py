@@ -240,7 +240,9 @@ class ComparisonChartBuilder:
                 x=1
             ),
             hovermode='x unified',
-            template='plotly_dark'
+            template='plotly_dark',
+            paper_bgcolor='rgba(14,17,23,1)',
+            plot_bgcolor='rgba(14,17,23,1)'
         )
         
         # Update axes
@@ -248,6 +250,8 @@ class ComparisonChartBuilder:
         fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
         fig.update_yaxes(title_text="Percentile %", range=[0, 100], row=3, col=1)
         fig.update_xaxes(title_text="Date", row=3, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
+        fig.update_yaxes(showgrid=True, gridcolor='#2d2d2d', zerolinecolor='#444', linecolor='#444', color='#FAFAFA')
         
         return fig, ratio_data
     
