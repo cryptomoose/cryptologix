@@ -445,32 +445,76 @@ def render_crypto_app():
 
         # ── Execute Rotation ──────────────────────────────────────────────────
         st.markdown("### ⚡ Execute Rotation")
-        rot_col1, rot_col2 = st.columns([2, 1])
-        with rot_col1:
-            if st.button("🔄 Execute Rotation", use_container_width=True):
-                if recommendation.rotation_direction:
-                    tracker.execute_rotation(
-                        recommendation.rotation_direction,
-                        recommendation.rotation_percentage,
-                        gold_pct=recommendation.gold_rotation_pct,
-                        silver_pct=recommendation.silver_rotation_pct
-                    )
-                    rlog.log_rotation(
-                        direction=recommendation.rotation_direction,
-                        rotation_pct=recommendation.rotation_percentage,
-                        signals=signals,
-                        live_prices=live_prices,
-                        cycle_phase=recommendation.cycle_phase.value,
-                    )
-                    st.success(f"✅ Logged: {recommendation.rotation_direction} {recommendation.rotation_percentage:.1f}%")
-                    st.rerun()
-                else:
-                    st.info("No rotation recommended this week")
-        with rot_col2:
+
+        # Signal recommendation display
+        sig_col1, sig_col2, sig_col3 = st.columns(3)
+        with sig_col1:
             if recommendation.rotation_direction:
-                st.metric("Recommended", recommendation.rotation_direction.replace('_', ' '))
+                st.metric("Signal Direction", recommendation.rotation_direction.replace('_', ' '))
             else:
-                st.metric("Signal", "HOLD")
+                st.metric("Signal", "HOLD — no rotation")
+        with sig_col2:
+            st.metric("Signal Suggested %",
+                      f"{recommendation.rotation_percentage:.1f}%" if recommendation.rotation_direction else "—")
+        with sig_col3:
+            st.metric("Cycle Phase", recommendation.cycle_phase.value.replace('_', ' '))
+
+        st.markdown("**Configure actual rotation:**")
+
+        # Direction selector — default to signal recommendation if present
+        direction_options = [
+            "BTC_TO_GOLD", "ETH_TO_GOLD",
+            "BTC_TO_SILVER", "ETH_TO_SILVER",
+            "GOLD_TO_BTC", "GOLD_TO_ETH",
+            "SILVER_TO_BTC", "SILVER_TO_ETH",
+        ]
+        default_direction = (
+            recommendation.rotation_direction
+            if recommendation.rotation_direction in direction_options
+            else direction_options[0]
+        )
+        input_col1, input_col2, input_col3 = st.columns(3)
+        with input_col1:
+            selected_direction = st.selectbox(
+                "Direction",
+                direction_options,
+                index=direction_options.index(default_direction),
+                format_func=lambda x: x.replace('_', ' ')
+            )
+        with input_col2:
+            # Parse from/to assets for labeling
+            parts = selected_direction.split('_TO_')
+            from_asset = parts[0] if len(parts) == 2 else 'CRYPTO'
+            to_asset   = parts[1] if len(parts) == 2 else 'METAL'
+            suggested_pct = recommendation.rotation_percentage if recommendation.rotation_direction else 25.0
+            actual_pct = st.number_input(
+                f"% of {from_asset} to rotate",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(round(suggested_pct, 1)),
+                step=5.0,
+                help="Suggested by signal engine — override as needed"
+            )
+        with input_col3:
+            rotation_notes = st.text_input("Notes (optional)", placeholder="e.g. partial take-profit")
+
+        if st.button("🔄 Execute Rotation", use_container_width=True):
+            tracker.execute_rotation(
+                selected_direction,
+                actual_pct,
+                gold_pct=actual_pct if 'GOLD' in selected_direction else 0,
+                silver_pct=actual_pct if 'SILVER' in selected_direction else 0,
+            )
+            rlog.log_rotation(
+                direction=selected_direction,
+                rotation_pct=actual_pct,
+                signals=signals,
+                live_prices=live_prices,
+                cycle_phase=recommendation.cycle_phase.value,
+                notes=rotation_notes,
+            )
+            st.success(f"✅ Logged: {selected_direction.replace('_', ' ')} {actual_pct:.1f}%")
+            st.rerun()
 
         st.markdown("---")
 
@@ -563,13 +607,37 @@ def render_crypto_app():
 
         st.markdown("---")
 
-        # ── Export ────────────────────────────────────────────────────────────
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=rlog.get_log_csv_bytes(),
-            file_name=f"cryptologix_rotations_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime='text/csv',
-        )
+        # ── Export / Reset ────────────────────────────────────────────────────
+        exp_col, reset_col = st.columns([2, 1])
+        with exp_col:
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=rlog.get_log_csv_bytes(),
+                file_name=f"cryptologix_rotations_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime='text/csv',
+            )
+        with reset_col:
+            if 'confirm_reset' not in st.session_state:
+                st.session_state.confirm_reset = False
+            if not st.session_state.confirm_reset:
+                if st.button("🗑️ Reset Log", use_container_width=True):
+                    st.session_state.confirm_reset = True
+                    st.rerun()
+            else:
+                st.warning("Delete all rotation history?")
+                yes_col, no_col = st.columns(2)
+                with yes_col:
+                    if st.button("✅ Yes, delete", use_container_width=True):
+                        import os
+                        if os.path.exists(rlog.LOG_PATH):
+                            os.remove(rlog.LOG_PATH)
+                        st.session_state.confirm_reset = False
+                        st.success("Log cleared.")
+                        st.rerun()
+                with no_col:
+                    if st.button("❌ Cancel", use_container_width=True):
+                        st.session_state.confirm_reset = False
+                        st.rerun()
 
     # ── TAB 0: OVERVIEW ────────────────────────────────────────────────────────
     with tab0:
