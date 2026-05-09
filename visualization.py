@@ -183,13 +183,13 @@ class ChartVisualizer:
         self._add_cycle_highlights(fig, cycles, df)
         
         # Update layout
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title=f'{crypto_name} Market Analysis Dashboard',
             xaxis_rangeslider_visible=False,
             height=800,
             showlegend=True,
-            plot_bgcolor='white',
-            paper_bgcolor='white'
+            plot_bgcolor='rgba(14,17,23,1)',
+            paper_bgcolor='rgba(14,17,23,1)'
         )
         
         # Update y-axes
@@ -272,14 +272,14 @@ class ChartVisualizer:
                     font=dict(color='white', size=10)
                 )
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title=f'{crypto_name} Market Cycles Analysis',
             xaxis_title='Date',
             yaxis_title='Price ($)',
             height=500,
             showlegend=True,
-            plot_bgcolor='white',
-            paper_bgcolor='white'
+            plot_bgcolor='rgba(14,17,23,1)',
+            paper_bgcolor='rgba(14,17,23,1)'
         )
         
         return fig
@@ -304,7 +304,7 @@ class ChartVisualizer:
             hoverongaps=False
         ))
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Technical Indicators Correlation Matrix',
             height=600,
             width=800
@@ -324,7 +324,7 @@ class ChartVisualizer:
                 showarrow=False,
                 font=dict(size=16)
             )
-            fig.update_layout(
+            fig.update_layout(template='plotly_dark', 
                 title='Strategy Performance',
                 height=400
             )
@@ -345,7 +345,7 @@ class ChartVisualizer:
             go.Bar(x=metrics, y=values, marker_color=colors)
         ])
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Strategy Performance Metrics',
             yaxis_title='Value',
             height=400
@@ -364,7 +364,7 @@ class ChartVisualizer:
                 showarrow=False,
                 font=dict(size=16)
             )
-            fig.update_layout(
+            fig.update_layout(template='plotly_dark', 
                 title='Signal Strength Analysis',
                 height=400
             )
@@ -390,7 +390,7 @@ class ChartVisualizer:
             )
         ])
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Current Signal Strength by Source',
             xaxis_title='Signal Source',
             yaxis_title='Signal Strength (1-10)',
@@ -413,7 +413,7 @@ class ChartVisualizer:
                 showarrow=False,
                 font=dict(size=16)
             )
-            fig.update_layout(
+            fig.update_layout(template='plotly_dark', 
                 title='Chart Pattern Confidence',
                 height=400
             )
@@ -433,7 +433,7 @@ class ChartVisualizer:
             )
         ])
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Chart Pattern Confidence Levels',
             xaxis_title='Pattern Type',
             yaxis_title='Confidence (%)',
@@ -545,7 +545,7 @@ class ChartVisualizer:
             )
         
         # Update layout
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Volume Analysis',
             height=600,
             yaxis=dict(title='Price ($)', side='left'),
@@ -599,7 +599,7 @@ class ChartVisualizer:
             row=2, col=1
         )
         
-        fig.update_layout(
+        fig.update_layout(template='plotly_dark', 
             title='Risk Metrics Dashboard',
             height=500,
             showlegend=True
