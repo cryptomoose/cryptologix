@@ -465,8 +465,6 @@ def render_crypto_app():
         direction_options = [
             "BTC_TO_GOLD", "ETH_TO_GOLD",
             "BTC_TO_SILVER", "ETH_TO_SILVER",
-            "GOLD_TO_BTC", "GOLD_TO_ETH",
-            "SILVER_TO_BTC", "SILVER_TO_ETH",
         ]
         default_direction = (
             recommendation.rotation_direction
