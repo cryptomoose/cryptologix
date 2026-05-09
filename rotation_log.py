@@ -1,24 +1,27 @@
 """
-Rotation Log — persistent CSV-backed ledger for DCA entries and rotations.
+Rotation Log — CSV-backed ledger for crypto↔metals rotations with live performance tracking.
 
 Storage: /tmp/cryptologix_rotation_log.csv (survives restarts, wiped on cold start)
-Export: Download button in UI for local backup.
+Export:  Download button in UI.
 
-Each entry captures:
-  - timestamp, entry_type (DCA | ROTATION)
-  - btc_amount_usd, eth_amount_usd, total_usd
-  - multiplier (DCA entries)
-  - rotation_direction, rotation_pct (rotation entries)
-  - btc_price, eth_price, gold_price, silver_price (at time of entry)
-  - btc_percentile, eth_percentile, btc_signal, eth_signal (signal snapshot)
-  - cycle_phase, notes
+Each rotation entry captures:
+  - timestamp, direction (e.g. BTC_TO_GOLD)
+  - rotation_pct: % of position rotated
+  - prices at execution: btc, eth, gold, silver
+  - signal snapshot: btc_percentile, eth_percentile, btc_signal, eth_signal, cycle_phase
+  - status: OPEN | CLOSED
+  - closed_at, close prices (on close)
+
+Performance calculated live on load:
+  - rotated_asset_return_pct: return on what you rotated INTO since execution
+  - crypto_held_return_pct:   return on the crypto you EXITED if you had held
+  - alpha_pct:                rotated - held (positive = rotation was correct)
 """
 
 import os
 import csv
 import logging
 from datetime import datetime
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +29,8 @@ LOG_PATH = '/tmp/cryptologix_rotation_log.csv'
 
 COLUMNS = [
     'timestamp',
-    'entry_type',           # DCA | ROTATION
-    'btc_amount_usd',
-    'eth_amount_usd',
-    'total_usd',
-    'multiplier',           # DCA multiplier vs baseline
-    'rotation_direction',   # CRYPTO_TO_GOLD | GOLD_TO_CRYPTO | etc.
-    'rotation_pct',         # % of portfolio rotated
+    'direction',
+    'rotation_pct',
     'btc_price',
     'eth_price',
     'gold_price',
@@ -43,109 +41,177 @@ COLUMNS = [
     'eth_signal',
     'cycle_phase',
     'notes',
+    'status',
+    'closed_at',
+    'close_btc_price',
+    'close_eth_price',
+    'close_gold_price',
+    'close_silver_price',
 ]
 
 
 def _ensure_log():
-    """Create log file with headers if it doesn't exist."""
     if not os.path.exists(LOG_PATH):
         with open(LOG_PATH, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=COLUMNS)
             writer.writeheader()
-        logger.info(f"Created new rotation log at {LOG_PATH}")
 
 
-def _append_entry(entry: dict):
-    """Append a single entry to the CSV."""
+def _rewrite_all(entries):
+    with open(LOG_PATH, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        for e in entries:
+            writer.writerow({col: e.get(col, '') for col in COLUMNS})
+
+
+def log_rotation(direction, rotation_pct, signals, live_prices, cycle_phase, notes=''):
     _ensure_log()
-    # Fill any missing columns with empty string
-    row = {col: entry.get(col, '') for col in COLUMNS}
+    entry = {
+        'timestamp':      datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'direction':      direction,
+        'rotation_pct':   round(rotation_pct, 1),
+        'btc_price':      round(live_prices.get('btc', 0), 2) if live_prices else '',
+        'eth_price':      round(live_prices.get('eth', 0), 2) if live_prices else '',
+        'gold_price':     round(live_prices.get('gold', 0), 2) if live_prices else '',
+        'silver_price':   round(live_prices.get('silver', 0), 4) if live_prices else '',
+        'btc_percentile': round(signals.get('btc_percentile', 0), 1),
+        'eth_percentile': round(signals.get('eth_percentile', 0), 1),
+        'btc_signal':     signals.get('btc_signal', ''),
+        'eth_signal':     signals.get('eth_signal', ''),
+        'cycle_phase':    cycle_phase,
+        'notes':          notes,
+        'status':         'OPEN',
+        'closed_at':      '',
+        'close_btc_price':    '',
+        'close_eth_price':    '',
+        'close_gold_price':   '',
+        'close_silver_price': '',
+    }
     with open(LOG_PATH, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        writer.writerow(row)
-    logger.info(f"Rotation log entry appended: {entry.get('entry_type')} ${entry.get('total_usd', 0):,.2f}")
+        writer.writerow(entry)
 
 
-def log_dca(
-    btc_amount_usd: float,
-    eth_amount_usd: float,
-    multiplier: float,
-    signals: dict,
-    live_prices: dict,
-    cycle_phase: str,
-    notes: str = ''
-):
-    """Record a DCA entry with full signal snapshot."""
-    entry = {
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'entry_type': 'DCA',
-        'btc_amount_usd': round(btc_amount_usd, 2),
-        'eth_amount_usd': round(eth_amount_usd, 2),
-        'total_usd': round(btc_amount_usd + eth_amount_usd, 2),
-        'multiplier': round(multiplier, 3),
-        'rotation_direction': '',
-        'rotation_pct': '',
-        'btc_price': round(live_prices.get('btc', 0), 2) if live_prices else '',
-        'eth_price': round(live_prices.get('eth', 0), 2) if live_prices else '',
-        'gold_price': round(live_prices.get('gold', 0), 2) if live_prices else '',
-        'silver_price': round(live_prices.get('silver', 0), 4) if live_prices else '',
-        'btc_percentile': round(signals.get('btc_percentile', 0), 1),
-        'eth_percentile': round(signals.get('eth_percentile', 0), 1),
-        'btc_signal': signals.get('btc_signal', ''),
-        'eth_signal': signals.get('eth_signal', ''),
-        'cycle_phase': cycle_phase,
-        'notes': notes,
-    }
-    _append_entry(entry)
+def close_rotation(row_index, live_prices):
+    entries = load_log_raw()
+    if row_index >= len(entries):
+        return False
+    e = entries[row_index]
+    if e['status'] == 'CLOSED':
+        return False
+    e['status']             = 'CLOSED'
+    e['closed_at']          = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    e['close_btc_price']    = round(live_prices.get('btc', 0), 2)
+    e['close_eth_price']    = round(live_prices.get('eth', 0), 2)
+    e['close_gold_price']   = round(live_prices.get('gold', 0), 2)
+    e['close_silver_price'] = round(live_prices.get('silver', 0), 4)
+    _rewrite_all(entries)
+    return True
 
 
-def log_rotation(
-    rotation_direction: str,
-    rotation_pct: float,
-    total_usd: float,
-    signals: dict,
-    live_prices: dict,
-    cycle_phase: str,
-    notes: str = ''
-):
-    """Record a rotation entry with full signal snapshot."""
-    entry = {
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'entry_type': 'ROTATION',
-        'btc_amount_usd': '',
-        'eth_amount_usd': '',
-        'total_usd': round(total_usd, 2),
-        'multiplier': '',
-        'rotation_direction': rotation_direction,
-        'rotation_pct': round(rotation_pct, 1),
-        'btc_price': round(live_prices.get('btc', 0), 2) if live_prices else '',
-        'eth_price': round(live_prices.get('eth', 0), 2) if live_prices else '',
-        'gold_price': round(live_prices.get('gold', 0), 2) if live_prices else '',
-        'silver_price': round(live_prices.get('silver', 0), 4) if live_prices else '',
-        'btc_percentile': round(signals.get('btc_percentile', 0), 1),
-        'eth_percentile': round(signals.get('eth_percentile', 0), 1),
-        'btc_signal': signals.get('btc_signal', ''),
-        'eth_signal': signals.get('eth_signal', ''),
-        'cycle_phase': cycle_phase,
-        'notes': notes,
-    }
-    _append_entry(entry)
-
-
-def load_log() -> list[dict]:
-    """Load all log entries as list of dicts. Returns [] if log doesn't exist."""
+def load_log_raw():
     _ensure_log()
     try:
         with open(LOG_PATH, 'r', newline='') as f:
-            reader = csv.DictReader(f)
-            return list(reader)
+            return list(csv.DictReader(f))
     except Exception as e:
-        logger.error(f"Failed to load rotation log: {e}")
+        logger.error(f"Failed to load log: {e}")
         return []
 
 
-def get_log_csv_bytes() -> bytes:
-    """Return raw CSV bytes for download button."""
+def _safe_float(val, default=None):
+    try:
+        return float(val) if val != '' else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_direction(direction):
+    direction = (direction or '').upper().strip()
+    if '_TO_' in direction:
+        parts = direction.split('_TO_')
+        return parts[0], parts[1]
+    if direction == 'ROTATE_TO_GOLD':
+        return 'BTC', 'GOLD'
+    if direction == 'ROTATE_TO_CRYPTO':
+        return 'GOLD', 'BTC'
+    return None, None
+
+
+def _price_key(asset):
+    return {'BTC': 'btc', 'ETH': 'eth', 'GOLD': 'gold', 'SILVER': 'silver'}.get(asset)
+
+
+def _entry_price(entry, asset, use_close=False):
+    key_map = (
+        {'BTC': 'close_btc_price', 'ETH': 'close_eth_price',
+         'GOLD': 'close_gold_price', 'SILVER': 'close_silver_price'}
+        if use_close else
+        {'BTC': 'btc_price', 'ETH': 'eth_price',
+         'GOLD': 'gold_price', 'SILVER': 'silver_price'}
+    )
+    return _safe_float(entry.get(key_map.get(asset, ''), ''))
+
+
+def compute_performance(entry, live_prices):
+    from_asset, to_asset = _parse_direction(entry.get('direction', ''))
+    if from_asset is None:
+        return {}
+
+    is_closed = entry.get('status', 'OPEN') == 'CLOSED'
+
+    entry_from = _entry_price(entry, from_asset)
+    entry_to   = _entry_price(entry, to_asset)
+
+    if is_closed:
+        eval_from = _entry_price(entry, from_asset, use_close=True)
+        eval_to   = _entry_price(entry, to_asset,   use_close=True)
+        eval_label = 'close'
+    else:
+        eval_from = live_prices.get(_price_key(from_asset))
+        eval_to   = live_prices.get(_price_key(to_asset))
+        eval_label = 'live'
+
+    rotated_return = ((eval_to - entry_to) / entry_to * 100
+                      if entry_to and eval_to and entry_to > 0 else None)
+    held_return    = ((eval_from - entry_from) / entry_from * 100
+                      if entry_from and eval_from and entry_from > 0 else None)
+    alpha = (rotated_return - held_return
+             if rotated_return is not None and held_return is not None else None)
+
+    return {
+        'from_asset':               from_asset,
+        'to_asset':                 to_asset,
+        'rotated_asset_return_pct': rotated_return,
+        'crypto_held_return_pct':   held_return,
+        'alpha_pct':                alpha,
+        'is_closed':                is_closed,
+        'evaluation_prices':        eval_label,
+    }
+
+
+def load_log_with_performance(live_prices):
+    return [{**e, **compute_performance(e, live_prices)} for e in load_log_raw()]
+
+
+def get_performance_summary(entries_with_perf):
+    if not entries_with_perf:
+        return {}
+    alphas = [e['alpha_pct'] for e in entries_with_perf if e.get('alpha_pct') is not None]
+    return {
+        'total_rotations':  len(entries_with_perf),
+        'open_rotations':   sum(1 for e in entries_with_perf if e.get('status') == 'OPEN'),
+        'closed_rotations': sum(1 for e in entries_with_perf if e.get('status') == 'CLOSED'),
+        'avg_alpha_pct':    round(sum(alphas) / len(alphas), 2) if alphas else None,
+        'win_rate_pct':     round(sum(1 for a in alphas if a > 0) / len(alphas) * 100, 1) if alphas else None,
+        'best_alpha_pct':   round(max(alphas), 2) if alphas else None,
+        'worst_alpha_pct':  round(min(alphas), 2) if alphas else None,
+        'total_alpha_pct':  round(sum(alphas), 2) if alphas else None,
+    }
+
+
+def get_log_csv_bytes():
     _ensure_log()
     try:
         with open(LOG_PATH, 'rb') as f:
@@ -153,47 +219,3 @@ def get_log_csv_bytes() -> bytes:
     except Exception as e:
         logger.error(f"Failed to read log for download: {e}")
         return b''
-
-
-def get_summary_stats(entries: list[dict]) -> dict:
-    """Compute summary stats from log entries."""
-    if not entries:
-        return {
-            'total_dca_entries': 0,
-            'total_rotation_entries': 0,
-            'total_deployed_usd': 0,
-            'total_btc_usd': 0,
-            'total_eth_usd': 0,
-            'avg_btc_percentile_at_dca': None,
-            'avg_eth_percentile_at_dca': None,
-            'last_entry_date': None,
-        }
-
-    dca = [e for e in entries if e['entry_type'] == 'DCA']
-    rotations = [e for e in entries if e['entry_type'] == 'ROTATION']
-
-    def safe_float(val, default=0.0):
-        try:
-            return float(val) if val != '' else default
-        except (ValueError, TypeError):
-            return default
-
-    total_deployed = sum(safe_float(e['total_usd']) for e in dca)
-    total_btc = sum(safe_float(e['btc_amount_usd']) for e in dca)
-    total_eth = sum(safe_float(e['eth_amount_usd']) for e in dca)
-
-    btc_pcts = [safe_float(e['btc_percentile']) for e in dca if e['btc_percentile'] != '']
-    eth_pcts = [safe_float(e['eth_percentile']) for e in dca if e['eth_percentile'] != '']
-
-    last_date = entries[-1]['timestamp'] if entries else None
-
-    return {
-        'total_dca_entries': len(dca),
-        'total_rotation_entries': len(rotations),
-        'total_deployed_usd': round(total_deployed, 2),
-        'total_btc_usd': round(total_btc, 2),
-        'total_eth_usd': round(total_eth, 2),
-        'avg_btc_percentile_at_dca': round(sum(btc_pcts) / len(btc_pcts), 1) if btc_pcts else None,
-        'avg_eth_percentile_at_dca': round(sum(eth_pcts) / len(eth_pcts), 1) if eth_pcts else None,
-        'last_entry_date': last_date,
-    }
