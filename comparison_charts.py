@@ -12,7 +12,7 @@ from rotation_optimizer import RotationRecommendationEngine
 import disk_cache
 
 # Cached data fetching functions (standalone for better caching)
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=0, show_spinner=False)
 def _fetch_crypto_data_cached(symbol):
     """Cache crypto data - 24h Streamlit TTL + disk persistence for cold starts"""
     cache_key = f'chart_crypto_{symbol}'
@@ -25,7 +25,7 @@ def _fetch_crypto_data_cached(symbol):
         disk_cache.save(cache_key, data)
     return data
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=0, show_spinner=False)
 def _fetch_metal_data_cached(symbol):
     """Cache metal data - 24h Streamlit TTL + disk persistence for cold starts"""
     cache_key = f'chart_metal_{symbol}'

@@ -63,7 +63,7 @@ def render_crypto_app():
         st.session_state.base_weekly_dca = 777
     
     # Get real-time prices for display (lightweight call, short cache)
-    @st.cache_data(ttl=14400)
+    @st.cache_data(ttl=0, show_spinner=False)
     def get_live_prices():
         fetcher = LongTermDataFetcher()
         return fetcher.get_realtime_prices()
@@ -329,7 +329,7 @@ def render_crypto_app():
         st.markdown("### 📊 ETH Fundamentals")
         st.caption("On-chain metrics for context when evaluating ETH rotation signals")
         
-        @st.cache_data(ttl=21600)
+        @st.cache_data(ttl=0, show_spinner=False)
         def get_eth_fundamentals():
             fetcher = ETHFundamentals()
             return fetcher.get_all_fundamentals()

@@ -21,7 +21,7 @@ class InvestmentSignalEngine:
         dca_config = DCAEnhancementConfig(settings.dca.to_dict())
         self.dca_engine = DCAEnhancementEngine(dca_config)
     
-    @st.cache_data(ttl=86400, show_spinner=False)
+    @st.cache_data(ttl=0, show_spinner=False)
     def compute_usd_percentiles(_self):
         """
         Calculate pure BTC/USD and ETH/USD percentiles (independent of metals)
@@ -96,7 +96,7 @@ class InvestmentSignalEngine:
             logger.error(f"USD percentile calculation failed: {e}")
             return None
     
-    @st.cache_data(ttl=86400, show_spinner=False)
+    @st.cache_data(ttl=0, show_spinner=False)
     def calculate_relative_valuation_scores(_self):
         """
         Calculate relative valuation scores for BTC/ETH vs Gold with extreme market top detection
