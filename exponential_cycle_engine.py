@@ -88,9 +88,8 @@ class ExponentialCycleEngine:
         else:
             btc_weight = 0.5  # Default to equal if no clear edge
         
-        # Apply Kelly Half: shrink 50% toward equal (0.5)
-        btc_weight = 0.5 * btc_weight + 0.25
-        
+        # Direct-ratio Kelly: weight proportional to relative undervaluation
+        # Cleaner than compressed version — no artificial signal dampening
         # Cap between 30-70%
         btc_weight = min(max(btc_weight, 0.30), 0.70)
         eth_weight = 1.0 - btc_weight
