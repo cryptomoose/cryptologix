@@ -132,7 +132,9 @@ def render_crypto_app():
         eth_percentile=signals['eth_percentile'],
         btc_signal=signals['btc_signal'],
         eth_signal=signals['eth_signal'],
-        portfolio_state=portfolio_state
+        portfolio_state=portfolio_state,
+        btc_gold_percentile=signals.get('btc_gold_percentile'),
+        eth_gold_percentile=signals.get('eth_gold_percentile'),
     )
     
     # Tab Layout — DCA Strategy | Gold Analysis | Silver Analysis | Rotation Log | Overview

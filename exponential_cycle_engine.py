@@ -102,7 +102,9 @@ class ExponentialCycleEngine:
         eth_percentile: float,
         btc_signal: int,
         eth_signal: int,
-        portfolio_state: PortfolioState
+        portfolio_state: PortfolioState,
+        btc_gold_percentile: float = None,
+        eth_gold_percentile: float = None,
     ) -> CycleRecommendation:
         """
         Generate unified weekly recommendation based on cycle phase
@@ -112,13 +114,17 @@ class ExponentialCycleEngine:
         
         # Determine current cycle phase
         cycle_phase = self._determine_cycle_phase(
-            btc_percentile, eth_percentile, portfolio_state
+            btc_percentile, eth_percentile, portfolio_state,
+            btc_gold_percentile=btc_gold_percentile,
+            eth_gold_percentile=eth_gold_percentile,
         )
         
         # Calculate cycle-appropriate actions
         if cycle_phase == CyclePhase.EXTREME_BOTTOM:
             return self._extreme_bottom_strategy(
-                btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state
+                btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state,
+                btc_gold_percentile=btc_gold_percentile,
+                eth_gold_percentile=eth_gold_percentile,
             )
         elif cycle_phase == CyclePhase.AGGRESSIVE_DCA:
             return self._aggressive_dca_strategy(
@@ -142,24 +148,37 @@ class ExponentialCycleEngine:
             )
     
     def _determine_cycle_phase(
-        self, 
-        btc_percentile: float, 
+        self,
+        btc_percentile: float,
         eth_percentile: float,
-        portfolio_state: PortfolioState
+        portfolio_state: PortfolioState,
+        btc_gold_percentile: float = None,
+        eth_gold_percentile: float = None,
     ) -> CyclePhase:
-        """Determine current phase in the exponential cycle"""
+        """Determine current phase in the exponential cycle.
         
+        Uses gold-ratio percentiles as the primary rotation trigger when available
+        — gold ratios are more historically accurate than USD percentiles because
+        they strip out dollar debasement and Fed policy distortion.
+        """
         avg_percentile = (btc_percentile + eth_percentile) / 2
-        
-        # CRITICAL: Check extreme percentiles FIRST before metals allocation
-        # This allows metals→USD liquidation when extreme bottom appears
-        
-        # Extreme bottom — percentile alone triggers rotation signal, regardless of metals held
-        if avg_percentile < 5:
+
+        # Use gold ratio percentiles for rotation trigger if available
+        # Gold ratios are the historically accurate signal at cycle bottoms
+        if btc_gold_percentile is not None and eth_gold_percentile is not None:
+            avg_gold_percentile = (btc_gold_percentile + eth_gold_percentile) / 2
+        else:
+            avg_gold_percentile = avg_percentile  # fallback to USD if gold data unavailable
+
+        # EXTREME BOTTOM: gold ratio percentiles trigger rotation
+        # Using gold avg < 5 OR both individual ratios < 5 (belt-and-suspenders)
+        if avg_gold_percentile < 5 or (btc_gold_percentile is not None and
+                eth_gold_percentile is not None and
+                btc_gold_percentile < 5 and eth_gold_percentile < 5):
             return CyclePhase.EXTREME_BOTTOM
 
-        # Aggressive DCA zone — strong accumulation signal
-        elif avg_percentile < 15:
+        # Aggressive DCA — gold avg below 15th pct
+        elif avg_gold_percentile < 15:
             return CyclePhase.AGGRESSIVE_DCA
         
         # Extreme top - time to rotate to metals (gold + silver)
@@ -180,7 +199,9 @@ class ExponentialCycleEngine:
     
     def _extreme_bottom_strategy(
         self, btc_pct: float, eth_pct: float, btc_sig: int, eth_sig: int,
-        portfolio: PortfolioState
+        portfolio: PortfolioState,
+        btc_gold_percentile: float = None,
+        eth_gold_percentile: float = None,
     ) -> CycleRecommendation:
         """
         EXTREME BOTTOM: Liquidate metals (gold + silver) → USD, then aggressive DCA into crypto
@@ -189,25 +210,24 @@ class ExponentialCycleEngine:
         """
         
         avg_pct = (btc_pct + eth_pct) / 2
-        
-        # Step 1: Liquidate metals if holding any
-        rotation_pct = 0
-        rotation_dir = None
-        
-        # Kelly-sized rotation regardless of tracked metals allocation
-        # Size based purely on percentile depth — user applies % to whatever metals they hold
-        if avg_pct < 2:
+
+        # Use gold ratio percentiles for sizing when available — more accurate at bottoms
+        if btc_gold_percentile is not None and eth_gold_percentile is not None:
+            avg_sizing_pct = (btc_gold_percentile + eth_gold_percentile) / 2
+        else:
+            avg_sizing_pct = avg_pct
+
+        # Kelly-sized rotation — size based on gold ratio depth
+        if avg_sizing_pct < 2:
             rotation_pct = 75   # Ultra-extreme
-        elif avg_pct < 5:
-            rotation_pct = 61.5 # Extreme (Kelly at current ratios)
+        elif avg_sizing_pct < 5:
+            rotation_pct = 61.5 # Extreme
         else:
             rotation_pct = 40   # Deep accumulation
 
-        # ETH/BTC split — weight toward lower percentile asset
         rotation_dir = 'metals_to_crypto'
-            
-        # Step 2: Don't DCA yet, first liquidate metals to USD
-        # Kelly allocation will be used in AGGRESSIVE_DCA phase
+
+        # Kelly allocation for BTC/ETH split
         btc_weight, eth_weight = self._calculate_kelly_split(btc_pct, eth_pct)
         
         return CycleRecommendation(
