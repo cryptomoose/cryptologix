@@ -259,7 +259,7 @@ class ExponentialCycleEngine:
             rotation_percentage=0,
             rotation_direction=None,
             confidence='high',
-            reasoning=f"AGGRESSIVE DCA ({avg_pct:.1f}th percentile): Deploy {dca_multiplier}x baseline from liquidated gold for exponential gains. Kelly allocation: BTC {btc_weight:.0%}, ETH {eth_weight:.0%}",
+            reasoning=f"AGGRESSIVE DCA ({avg_pct:.1f}th percentile): Deploy {dca_multiplier}x weekly DCA. Kelly allocation: BTC {btc_weight:.0%}, ETH {eth_weight:.0%}",
             expected_outcome=f"Position for {dca_multiplier}x returns when market recovers to mean"
         )
     
