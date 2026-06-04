@@ -154,12 +154,12 @@ class ExponentialCycleEngine:
         # CRITICAL: Check extreme percentiles FIRST before metals allocation
         # This allows metals→USD liquidation when extreme bottom appears
         
-        # Extreme bottom with metals (gold + silver) - time to liquidate metals→USD
-        if avg_percentile < 5 and portfolio_state.metals_allocation > 5:
+        # Extreme bottom — percentile alone triggers rotation signal, regardless of metals held
+        if avg_percentile < 5:
             return CyclePhase.EXTREME_BOTTOM
-        
-        # Aggressive DCA - we have USD available (from metals liquidation) and low prices
-        elif avg_percentile < 15 and portfolio_state.usd_available > 0:
+
+        # Aggressive DCA zone — strong accumulation signal
+        elif avg_percentile < 15:
             return CyclePhase.AGGRESSIVE_DCA
         
         # Extreme top - time to rotate to metals (gold + silver)
@@ -194,14 +194,17 @@ class ExponentialCycleEngine:
         rotation_pct = 0
         rotation_dir = None
         
-        if portfolio.metals_allocation > 5:
-            # Liquidate 80-95% of metals back to USD for aggressive deployment
-            if avg_pct < 2:
-                rotation_pct = 95  # Ultra-extreme: liquidate almost everything
-            elif avg_pct < 5:
-                rotation_pct = 80  # Extreme: liquidate most
-            
-            rotation_dir = 'metals_to_usd'
+        # Kelly-sized rotation regardless of tracked metals allocation
+        # Size based purely on percentile depth — user applies % to whatever metals they hold
+        if avg_pct < 2:
+            rotation_pct = 75   # Ultra-extreme
+        elif avg_pct < 5:
+            rotation_pct = 61.5 # Extreme (Kelly at current ratios)
+        else:
+            rotation_pct = 40   # Deep accumulation
+
+        # ETH/BTC split — weight toward lower percentile asset
+        rotation_dir = 'metals_to_crypto'
             
         # Step 2: Don't DCA yet, first liquidate metals to USD
         # Kelly allocation will be used in AGGRESSIVE_DCA phase
@@ -216,8 +219,8 @@ class ExponentialCycleEngine:
             rotation_percentage=rotation_pct,
             rotation_direction=rotation_dir,
             confidence='high',
-            reasoning=f"EXTREME BOTTOM ({avg_pct:.1f}th percentile): Liquidate gold & silver to USD now. Next phase: aggressive deployment with Kelly allocation (BTC {btc_weight:.0%}, ETH {eth_weight:.0%})",
-            expected_outcome=f"Convert precious metals holdings to USD for maximum accumulation opportunity"
+            reasoning=f"EXTREME BOTTOM ({avg_pct:.1f}th percentile): Rotate {rotation_pct}% of gold/silver holdings directly into crypto. Kelly split: BTC {btc_weight:.0%} / ETH {eth_weight:.0%}. Size applies to whatever metals you hold — no dollar amount required.",
+            expected_outcome=f"Liquidate {rotation_pct}% of metals → deploy {btc_weight:.0%} BTC / {eth_weight:.0%} ETH on spot exchange"
         )
     
     def _aggressive_dca_strategy(

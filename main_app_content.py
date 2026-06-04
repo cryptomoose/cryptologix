@@ -461,13 +461,24 @@ def render_crypto_app():
 
         st.markdown("**Configure actual rotation:**")
 
+        # Metals→crypto rotation banner
+        if recommendation.rotation_direction == 'metals_to_crypto':
+            st.error(
+                f"🚨 **METALS→CRYPTO ROTATION SIGNAL ACTIVE** — "
+                f"Liquidate **{recommendation.rotation_percentage:.1f}%** of gold/silver holdings → buy BTC/ETH spot. "
+                f"{recommendation.reasoning}"
+            )
+
         # Direction selector — default to signal recommendation if present
         direction_options = [
+            "METALS_TO_CRYPTO",
             "BTC_TO_GOLD", "ETH_TO_GOLD",
             "BTC_TO_SILVER", "ETH_TO_SILVER",
         ]
         default_direction = (
-            recommendation.rotation_direction
+            "METALS_TO_CRYPTO"
+            if recommendation.rotation_direction == "metals_to_crypto"
+            else recommendation.rotation_direction
             if recommendation.rotation_direction in direction_options
             else direction_options[0]
         )

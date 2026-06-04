@@ -129,7 +129,7 @@ class PortfolioStateTracker:
             new_silver = st.session_state.portfolio_state.get('silver_allocation', 0) + (crypto_to_move * silver_pct / 100)
             new_usd = st.session_state.portfolio_state.get('usd_allocation', 0)  # Unchanged
             
-        elif rotation_type in ['gold_to_usd', 'metals_to_usd']:
+        elif rotation_type in ['gold_to_usd', 'metals_to_usd', 'metals_to_crypto', 'METALS_TO_CRYPTO']:
             # Liquidate both gold AND silver → USD (for aggressive DCA deployment)
             gold_to_liquidate = st.session_state.portfolio_state['gold_allocation'] * (percentage / 100)
             silver_to_liquidate = st.session_state.portfolio_state.get('silver_allocation', 0) * (percentage / 100)
