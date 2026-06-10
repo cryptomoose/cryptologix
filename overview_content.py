@@ -59,14 +59,17 @@ def render_overview_tab():
         **Goal:** Build positions while crypto is undervalued
         
         ### Phase 2: 🟡 BULL MARKET
-        **Market Percentile:** 45th - 85th  
-        **Action:** Baseline DCA at 1.0x multiplier  
+        **Market Percentile:** 45th - 75th
+        **Action:** Baseline DCA at 1.0x multiplier
         **Goal:** Maintain discipline, avoid FOMO
-        
+
         ### Phase 3: 🔴 EXTREME TOP
-        **Market Percentile:** >85th  
-        **Action:** Rotate crypto → gold (0-75% based on signals)  
+        **Market Percentile:** >85th
+        **Action:** Rotate 85-90% out of crypto — 70% metals (gold 70% / silver 30%) + 30% stablecoins (Aave/sDAI)
         **Goal:** Lock in gains, preserve capital
+
+        ### Phase 3.5: 🟠 BULL REDUCE
+        **Market Percentile:** 75-85th | **Action:** Stop DCA, prepare rotation | **Goal:** Maximize exit price
         """)
     
     with col2:

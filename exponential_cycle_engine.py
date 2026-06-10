@@ -17,8 +17,10 @@ class CyclePhase(Enum):
     EXTREME_BOTTOM = "extreme_bottom"          # <5% percentile - liquidate gold→USD
     AGGRESSIVE_DCA = "aggressive_dca"          # Deploy USD with 2-3x multipliers
     ACCUMULATION = "accumulation"              # 5-45% - normal to increased DCA
-    BULL_MARKET = "bull_market"                # 45-85% - maintain baseline DCA
-    EXTREME_TOP = "extreme_top"                # >85% - rotate to gold, reduce DCA
+    BULL_MARKET = "bull_market"                # 45-75% - maintain baseline DCA
+    BULL_REDUCE = "bull_reduce"                # 75-85% - stop DCA, prepare to sell
+    EXTREME_TOP = "extreme_top"                # 85-92% - rotate to metals + stables
+    ULTRA_TOP = "ultra_top"                    # >92% - maximum rotation, keep only validators
     GOLD_HOLDING = "gold_holding"              # Post-rotation - wait for extreme bottom
 
 @dataclass
@@ -53,6 +55,7 @@ class CycleRecommendation:
     rotation_direction: Optional[str]  # 'crypto_to_metals', 'metals_to_usd', None
     gold_rotation_pct: float = 70.0  # % of metal rotation going to gold (default 70%)
     silver_rotation_pct: float = 30.0  # % of metal rotation going to silver (default 30%)
+    stables_pct: float = 0.0  # % of portfolio rotating to stablecoins (0-100 scale)
     confidence: str = 'medium'  # 'low', 'medium', 'high'
     reasoning: str = ''
     expected_outcome: str = ''
@@ -138,8 +141,16 @@ class ExponentialCycleEngine:
             return self._bull_market_strategy(
                 btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state
             )
+        elif cycle_phase == CyclePhase.BULL_REDUCE:
+            return self._bull_reduce_strategy(
+                btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state
+            )
         elif cycle_phase == CyclePhase.EXTREME_TOP:
             return self._extreme_top_strategy(
+                btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state
+            )
+        elif cycle_phase == CyclePhase.ULTRA_TOP:
+            return self._ultra_top_strategy(
                 btc_percentile, eth_percentile, btc_signal, eth_signal, portfolio_state
             )
         elif cycle_phase == CyclePhase.GOLD_HOLDING:
@@ -181,7 +192,15 @@ class ExponentialCycleEngine:
         elif avg_gold_percentile < 15:
             return CyclePhase.AGGRESSIVE_DCA
         
-        # Extreme top - time to rotate to metals (gold + silver)
+        # Bull reduce — stop DCA, prepare to sell ahead of the 85th pct rotation trigger
+        elif avg_gold_percentile >= 75 and avg_gold_percentile < 85:
+            return CyclePhase.BULL_REDUCE
+
+        # Ultra top - maximum rotation, keep only validators
+        elif avg_percentile >= 92:
+            return CyclePhase.ULTRA_TOP
+
+        # Extreme top - time to rotate to metals (gold + silver) + stables
         elif avg_percentile >= 85:
             return CyclePhase.EXTREME_TOP
         
@@ -351,54 +370,103 @@ class ExponentialCycleEngine:
             expected_outcome="Steady accumulation during normal market conditions"
         )
     
+    def _bull_reduce_strategy(
+        self, btc_pct: float, eth_pct: float, btc_sig: int, eth_sig: int,
+        portfolio: PortfolioState
+    ) -> CycleRecommendation:
+        """
+        BULL REDUCE: Stop DCA, begin trimming in tranches ahead of the 85th pct rotation
+        """
+
+        avg_pct = (btc_pct + eth_pct) / 2
+
+        return CycleRecommendation(
+            cycle_phase=CyclePhase.BULL_REDUCE,
+            primary_action="PREPARE_TO_SELL",
+            dca_amount_usd=0,
+            btc_amount_usd=0,
+            eth_amount_usd=0,
+            rotation_percentage=0,
+            rotation_direction=None,
+            confidence='high',
+            reasoning=f"BULL_REDUCE ({avg_pct:.1f}th percentile): Stop DCA. Begin trimming positions in tranches. Target rotation at 85th pct: 70% metals (gold 70%/silver 30%) + 30% stablecoins. Keep validators running. Sell BTC first.",
+            expected_outcome="DCA halted, positions staged for rotation at the 85th percentile trigger"
+        )
+
     def _extreme_top_strategy(
         self, btc_pct: float, eth_pct: float, btc_sig: int, eth_sig: int,
         portfolio: PortfolioState
     ) -> CycleRecommendation:
         """
-        EXTREME TOP: Rotate crypto → metals (gold + silver), reduce DCA to baseline minimum
-        
+        EXTREME TOP: Rotate crypto → metals (gold + silver) + stablecoins, halt DCA
+
         This is where we lock in gains and prepare for the next cycle
         """
-        
+
         avg_pct = (btc_pct + eth_pct) / 2
-        
-        # Calculate rotation percentage based on extreme level
-        if avg_pct >= 98:
-            rotation_pct = 75  # Ultra-extreme: rotate most
-        elif avg_pct >= 95:
-            rotation_pct = 60  # Extreme: rotate majority
-        elif avg_pct >= 90:
-            rotation_pct = 45  # Very high: rotate significant portion
-        else:
-            rotation_pct = 30  # High: rotate conservative amount
-        
+
+        # Framework split: keep 15% crypto, 59.5% to metals, 25.5% to stables
+        crypto_keep = 0.15
+        metals_pct = 0.595
+        stables_pct = 0.255
+        rotation_pct = round((metals_pct + stables_pct) * 100, 1)  # 85% of portfolio
+
         # Split between gold and silver (70/30 default)
         gold_pct = 70.0
         silver_pct = 30.0
-        
-        # Reduce DCA significantly at tops
-        dca_multiplier = 0.3  # 30% of baseline
-        total_dca = self.base_weekly_dca * dca_multiplier
-        
-        # Kelly Half allocation
-        btc_weight, eth_weight = self._calculate_kelly_split(btc_pct, eth_pct)
-        btc_amount = total_dca * btc_weight
-        eth_amount = total_dca * eth_weight
-        
+
+        # No DCA at tops — capital goes to rotation, not buying
+        total_dca = 0.0
+
         return CycleRecommendation(
             cycle_phase=CyclePhase.EXTREME_TOP,
-            primary_action="ROTATE_TO_METALS",
+            primary_action="ROTATE_TO_METALS_AND_STABLES",
             dca_amount_usd=total_dca,
-            btc_amount_usd=btc_amount,
-            eth_amount_usd=eth_amount,
+            btc_amount_usd=0,
+            eth_amount_usd=0,
             rotation_percentage=rotation_pct,
-            rotation_direction='crypto_to_metals',
+            rotation_direction='crypto_to_metals_and_stables',
             gold_rotation_pct=gold_pct,
             silver_rotation_pct=silver_pct,
+            stables_pct=stables_pct * 100,
             confidence='high',
-            reasoning=f"EXTREME TOP ({avg_pct:.1f}th percentile): Rotate {rotation_pct}% to precious metals ({gold_pct:.0f}% gold, {silver_pct:.0f}% silver). Kelly allocation: BTC {btc_weight:.0%}, ETH {eth_weight:.0%}",
-            expected_outcome=f"Lock in {rotation_pct}% of gains in gold & silver, wait for extreme bottom to redeploy"
+            reasoning=f"EXTREME TOP ({avg_pct:.1f}th percentile): Rotate {rotation_pct:.0f}% out of crypto — {metals_pct*100:.1f}% of portfolio to metals, {stables_pct*100:.1f}% to stablecoins, keep {crypto_keep*100:.0f}% crypto. Gold 70% / Silver 30% of metals tranche. Stables to Aave supply or sDAI for redeployment at next bottom. Execute in tranches over 2-4 weeks. Sell BTC first. Keep validators running.",
+            expected_outcome=f"Lock in gains: {metals_pct*100:.1f}% metals + {stables_pct*100:.1f}% stables, redeploy at next extreme bottom"
+        )
+
+    def _ultra_top_strategy(
+        self, btc_pct: float, eth_pct: float, btc_sig: int, eth_sig: int,
+        portfolio: PortfolioState
+    ) -> CycleRecommendation:
+        """
+        ULTRA TOP (>92nd pct): Maximum rotation — keep only validators (10% crypto floor)
+        """
+
+        avg_pct = (btc_pct + eth_pct) / 2
+
+        # Maximum rotation: keep 10% crypto, 63% to metals, 27% to stables
+        crypto_keep = 0.10
+        metals_pct = 0.63
+        stables_pct = 0.27
+        rotation_pct = round((metals_pct + stables_pct) * 100, 1)  # 90% of portfolio
+
+        gold_pct = 70.0
+        silver_pct = 30.0
+
+        return CycleRecommendation(
+            cycle_phase=CyclePhase.ULTRA_TOP,
+            primary_action="MAXIMUM_ROTATION",
+            dca_amount_usd=0,
+            btc_amount_usd=0,
+            eth_amount_usd=0,
+            rotation_percentage=rotation_pct,
+            rotation_direction='crypto_to_metals_and_stables',
+            gold_rotation_pct=gold_pct,
+            silver_rotation_pct=silver_pct,
+            stables_pct=stables_pct * 100,
+            confidence='high',
+            reasoning=f"ULTRA_TOP — maximum rotation ({avg_pct:.1f}th percentile): Rotate {rotation_pct:.0f}% out of crypto — {metals_pct*100:.0f}% of portfolio to metals (gold 70%/silver 30%), {stables_pct*100:.0f}% to stablecoins (Aave supply or sDAI), keep {crypto_keep*100:.0f}% crypto. Keep only validators. Execute in tranches over 2-4 weeks. Sell BTC first, ETH second.",
+            expected_outcome=f"Maximum gains locked: {metals_pct*100:.0f}% metals + {stables_pct*100:.0f}% stables, validators only in crypto"
         )
     
     def _gold_holding_strategy(

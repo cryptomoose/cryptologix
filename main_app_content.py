@@ -191,7 +191,9 @@ def render_crypto_app():
                 CyclePhase.AGGRESSIVE_DCA: "#00FF00",
                 CyclePhase.ACCUMULATION: "#90EE90",
                 CyclePhase.BULL_MARKET: "#FFA500",
+                CyclePhase.BULL_REDUCE: "#FF8C00",
                 CyclePhase.EXTREME_TOP: "#FF4444",
+                CyclePhase.ULTRA_TOP: "#CC0000",
                 CyclePhase.GOLD_HOLDING: "#FFD700"
             }
         
@@ -211,9 +213,23 @@ def render_crypto_app():
             action_text = recommendation.primary_action.replace('_', ' ').title().replace('Dca', 'DCA')
             st.markdown(f"#### {action_text}")
             st.caption(recommendation.reasoning)
-            
+
+            # Lifecycle rotation banners
+            if recommendation.cycle_phase == CyclePhase.BULL_REDUCE:
+                st.warning(
+                    "⚠️ BULL_REDUCE — Stop DCA. Prepare to sell. "
+                    "Rotation triggers at 85th percentile: 70% metals + 30% stablecoins."
+                )
+            elif recommendation.cycle_phase in (CyclePhase.EXTREME_TOP, CyclePhase.ULTRA_TOP):
+                rotation_pct = recommendation.rotation_percentage
+                st.error(
+                    f"🔴 {recommendation.cycle_phase.value.replace('_', ' ').upper()} — "
+                    f"Rotate {rotation_pct:.0f}% → Metals {rotation_pct*0.70:.1f}% (gold 70% / silver 30%) "
+                    f"+ Stables {rotation_pct*0.30:.1f}% (Aave/sDAI)"
+                )
+
             st.markdown("")  # Spacer
-            
+
             # Investment Allocation
             if recommendation.btc_amount_usd > 0 or recommendation.eth_amount_usd > 0:
                 st.markdown("#### 💰 Investment Breakdown")
@@ -237,6 +253,14 @@ def render_crypto_app():
                 
                 if 'date_range' in signals:
                     st.caption(f"📊 Historical Data: {signals.get('data_days', 0):,} days ({signals['date_range']})")
+            elif recommendation.cycle_phase == CyclePhase.BULL_REDUCE:
+                st.markdown("#### 💰 Investment Breakdown")
+                col_btc2, col_eth2 = st.columns(2)
+                with col_btc2:
+                    st.metric("Bitcoin (BTC)", "$0.00")
+                with col_eth2:
+                    st.metric("Ethereum (ETH)", "$0.00")
+                st.caption("DCA paused — preparing for rotation")
         
         with col2:
             # Data Freshness Status
@@ -470,16 +494,28 @@ def render_crypto_app():
                 f"Liquidate **{recommendation.rotation_percentage:.1f}%** of gold/silver holdings → buy BTC/ETH spot. "
                 f"{recommendation.reasoning}"
             )
+        # Top rotation banner — crypto→metals+stables
+        elif recommendation.rotation_direction == 'crypto_to_metals_and_stables':
+            rotation_pct = recommendation.rotation_percentage
+            st.error(
+                f"🚨 **TOP ROTATION SIGNAL ACTIVE** — "
+                f"Rotate {rotation_pct:.0f}% → Metals {rotation_pct*0.70:.1f}% (gold 70% / silver 30%) "
+                f"+ Stables {rotation_pct*0.30:.1f}% (Aave/sDAI). "
+                f"{recommendation.reasoning}"
+            )
 
         # Direction selector — default to signal recommendation if present
         direction_options = [
             "METALS_TO_CRYPTO",
+            "CRYPTO_TO_METALS_AND_STABLES",
             "BTC_TO_GOLD", "ETH_TO_GOLD",
             "BTC_TO_SILVER", "ETH_TO_SILVER",
         ]
         default_direction = (
             "METALS_TO_CRYPTO"
             if recommendation.rotation_direction == "metals_to_crypto"
+            else "CRYPTO_TO_METALS_AND_STABLES"
+            if recommendation.rotation_direction == "crypto_to_metals_and_stables"
             else recommendation.rotation_direction
             if recommendation.rotation_direction in direction_options
             else direction_options[0]
