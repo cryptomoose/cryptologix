@@ -80,24 +80,11 @@ class ExponentialCycleEngine:
         
         Uses simplified Kelly based on relative signal strength when full historical stats unavailable
         """
-        # Use percentiles as proxy for relative value
-        # Lower percentile = more undervalued = higher Kelly allocation
-        btc_edge = max(0, (50 - btc_percentile) / 50)  # 0-1 where 1 is most undervalued
-        eth_edge = max(0, (50 - eth_percentile) / 50)
-        
-        total_edge = btc_edge + eth_edge
-        if total_edge > 0:
-            btc_weight = btc_edge / total_edge
-        else:
-            btc_weight = 0.5  # Default to equal if no clear edge
-        
-        # Direct-ratio Kelly: weight proportional to relative undervaluation
-        # Cleaner than compressed version — no artificial signal dampening
-        # Cap between 30-70%
-        btc_weight = min(max(btc_weight, 0.30), 0.70)
-        eth_weight = 1.0 - btc_weight
-        
-        return btc_weight, eth_weight
+        # Delegated to signal_core (shared verbatim with the crypto engine):
+        # true Kelly f=μ/σ² from empirical percentile-conditioned returns and
+        # 2y volatility, not the old tilt heuristic.
+        from signal_core import kelly_split_btc_eth
+        return kelly_split_btc_eth(btc_percentile, eth_percentile)
         
     def generate_weekly_recommendation(
         self,
@@ -236,13 +223,9 @@ class ExponentialCycleEngine:
         else:
             avg_sizing_pct = avg_pct
 
-        # Kelly-sized rotation — size based on gold ratio depth
-        if avg_sizing_pct < 2:
-            rotation_pct = 75   # Ultra-extreme
-        elif avg_sizing_pct < 5:
-            rotation_pct = 61.5 # Extreme
-        else:
-            rotation_pct = 40   # Deep accumulation
+        # Kelly-sized rotation — continuous depth scaling from signal_core
+        # (40% at the 5th pct up to 75% at the 0th; replaces 75/61.5/40 steps)
+        rotation_pct = round(min(75.0, max(40.0, 75.0 - 7.0 * avg_sizing_pct)), 1)
 
         rotation_dir = 'metals_to_crypto'
 
@@ -273,15 +256,12 @@ class ExponentialCycleEngine:
         """
         
         avg_pct = (btc_pct + eth_pct) / 2
-        
-        # Aggressive DCA multiplier based on how extreme the bottom
-        if avg_pct < 5:
-            dca_multiplier = 3.0  # 3x baseline
-        elif avg_pct < 10:
-            dca_multiplier = 2.5  # 2.5x baseline
-        else:
-            dca_multiplier = 2.0  # 2x baseline
-            
+
+        # Continuous GTO multiplier from signal_core (logistic through
+        # 3.0x@0th / 1.0x@35th / 0.5x@50th — no step-function breakpoints)
+        from signal_core import gto_multiplier
+        dca_multiplier = round(gto_multiplier(avg_pct), 2)
+
         total_dca = self.base_weekly_dca * dca_multiplier
         
         # Kelly Half allocation between BTC/ETH
@@ -312,14 +292,11 @@ class ExponentialCycleEngine:
         
         avg_pct = (btc_pct + eth_pct) / 2
         
-        # Scaled DCA based on how undervalued
-        if avg_pct < 15:
-            dca_multiplier = 1.7
-        elif avg_pct < 30:
-            dca_multiplier = 1.4
-        else:
-            dca_multiplier = 1.2
-            
+        # Continuous GTO multiplier — same curve as the crypto engine (signal_core)
+        from signal_core import gto_multiplier
+        dca_multiplier = round(gto_multiplier(avg_pct), 2)
+
+
         total_dca = self.base_weekly_dca * dca_multiplier
         
         # Kelly Half allocation
@@ -350,13 +327,17 @@ class ExponentialCycleEngine:
         
         avg_pct = (btc_pct + eth_pct) / 2
         
-        total_dca = self.base_weekly_dca * 1.0  # Baseline
-        
+        # Continuous GTO multiplier — tapers below 1.0x as the cycle heats up,
+        # matching the crypto engine's curve (signal_core)
+        from signal_core import gto_multiplier
+        dca_multiplier = round(gto_multiplier(avg_pct), 2)
+        total_dca = self.base_weekly_dca * dca_multiplier
+
         # Kelly Half allocation
         btc_weight, eth_weight = self._calculate_kelly_split(btc_pct, eth_pct)
         btc_amount = total_dca * btc_weight
         eth_amount = total_dca * eth_weight
-        
+
         return CycleRecommendation(
             cycle_phase=CyclePhase.BULL_MARKET,
             primary_action="MAINTAIN_BASELINE_DCA",
@@ -366,7 +347,7 @@ class ExponentialCycleEngine:
             rotation_percentage=0,
             rotation_direction=None,
             confidence='medium',
-            reasoning=f"BULL MARKET ({avg_pct:.1f}th percentile): Fair valuation. Baseline DCA with Kelly allocation: BTC {btc_weight:.0%}, ETH {eth_weight:.0%}",
+            reasoning=f"BULL MARKET ({avg_pct:.1f}th percentile): Fair-to-warm valuation. {dca_multiplier}x DCA (continuous GTO taper) with Kelly allocation: BTC {btc_weight:.0%}, ETH {eth_weight:.0%}",
             expected_outcome="Steady accumulation during normal market conditions"
         )
     
@@ -405,11 +386,14 @@ class ExponentialCycleEngine:
 
         avg_pct = (btc_pct + eth_pct) / 2
 
-        # Framework split: keep 15% crypto, 59.5% to metals, 25.5% to stables
-        crypto_keep = 0.15
-        metals_pct = 0.595
-        stables_pct = 0.255
-        rotation_pct = round((metals_pct + stables_pct) * 100, 1)  # 85% of portfolio
+        # Continuous rotation ramp — same curve as the crypto engine (signal_core):
+        # 30% at the 85th pct scaling +5pts per percentile, capped at 90%.
+        # Rotation splits 70% metals / 30% stables of the rotated tranche.
+        from signal_core import top_rotation_pct
+        rotation_pct = round(top_rotation_pct(avg_pct), 1)
+        crypto_keep = 1.0 - rotation_pct / 100.0
+        metals_pct = 0.70 * rotation_pct / 100.0
+        stables_pct = 0.30 * rotation_pct / 100.0
 
         # Split between gold and silver (70/30 default)
         gold_pct = 70.0
@@ -444,11 +428,13 @@ class ExponentialCycleEngine:
 
         avg_pct = (btc_pct + eth_pct) / 2
 
-        # Maximum rotation: keep 10% crypto, 63% to metals, 27% to stables
-        crypto_keep = 0.10
-        metals_pct = 0.63
-        stables_pct = 0.27
-        rotation_pct = round((metals_pct + stables_pct) * 100, 1)  # 90% of portfolio
+        # Continuous rotation ramp — identical curve to the crypto engine (signal_core),
+        # reaching the 90% cap at the 97th percentile.
+        from signal_core import top_rotation_pct
+        rotation_pct = round(top_rotation_pct(avg_pct), 1)
+        crypto_keep = 1.0 - rotation_pct / 100.0
+        metals_pct = 0.70 * rotation_pct / 100.0
+        stables_pct = 0.30 * rotation_pct / 100.0
 
         gold_pct = 70.0
         silver_pct = 30.0

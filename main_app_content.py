@@ -181,6 +181,16 @@ def render_crypto_app():
 
         st.markdown("---")
 
+        # UBI Gap — top-level objective, drives capital allocation decisions
+        from ubi_gap_content import render_ubi_gap_section
+        _avg_cycle_pct = (signals['btc_percentile'] + signals['eth_percentile']) / 2
+        render_ubi_gap_section(
+            cycle_pct=_avg_cycle_pct,
+            weekly_dca_usd=recommendation.dca_amount_usd,
+        )
+
+        st.markdown("---")
+
         # Main Layout
         col1, col2 = st.columns([2, 1])
     
