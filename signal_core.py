@@ -22,6 +22,9 @@ Design principles:
 import math
 import hashlib
 import os
+import logging
+
+log = logging.getLogger(__name__)
 
 SIGNAL_CORE_VERSION = "1.0.0"
 
@@ -75,9 +78,9 @@ UBI_TARGET_MONTHLY = 1500.0
 CYCLE_WINDOW_DAYS = 730  # 2-year rolling window, matches both pipelines
 
 
-def cycle_percentile(state: dict) -> float:
-    """Blended cycle percentile = mean of BTC/USD and ETH/USD percentile
-    ranks within the trailing 730-calendar-day window.
+def _raw_cycle_percentile(state: dict) -> float:
+    """Unsmoothed blended cycle percentile = mean of BTC/USD and ETH/USD
+    percentile ranks within the trailing 730-calendar-day window.
 
     Accepts a crypto_state.json-shaped dict (reads state['ratios']) or a
     ratios dict directly (btc_usd_pct / eth_usd_pct keys)."""
@@ -87,6 +90,54 @@ def cycle_percentile(state: dict) -> float:
     btc = float(r.get("btc_usd_pct", 50) or 50)
     eth = float(r.get("eth_usd_pct", 50) or 50)
     return round((btc + eth) / 2, 1)
+
+
+# Investigated 2026-07-02: cycle_percentile's own formula has no fear/greed
+# term and no outsized single-component weight (it's a plain BTC/ETH rank
+# average) — the swings traced to real BTC/ETH price moves (several percent
+# over a few days) landing in the sparse left tail of the trailing-730d
+# distribution, where the rank statistic is inherently high-derivative:
+# a handful of historically-similar low prices sit close together, so a
+# small % move can jump the rank past many of them at once. That's not a
+# bug in the inputs, but it does make the raw number noisy day-to-day at
+# cycle extremes — hence the smoothing guard below.
+CYCLE_PCT_SMOOTHING_ALPHA = 0.3
+CYCLE_PCT_JUMP_THRESHOLD_PP = 3.0
+CYCLE_PCT_STABLE_BTC_MOVE_PCT = 2.0
+
+
+def cycle_percentile(state: dict) -> float:
+    """Blended cycle percentile (see _raw_cycle_percentile), with a
+    stability guard: if the raw value jumps >3pp from the last computed
+    value while BTC's 24h move is <2%, the jump is presumed to be
+    rank-statistic noise (see note above) rather than a genuine regime
+    change, and is damped via exponential smoothing (alpha=0.3) instead of
+    passed through raw. Mutates state['cycle_percentile_prev'] and
+    state['cycle_percentile_smoothing_applied'] as a side effect so the
+    caller can persist them for the next run."""
+    new_pct = _raw_cycle_percentile(state)
+    prev_pct = state.get("cycle_percentile_prev")
+    _btc_change = state.get("btc_24h_change_pct")
+    if _btc_change is None:
+        _btc_change = (state.get("prices", {}) or {}).get("btc_24h", 0)
+    btc_change_pct = abs(float(_btc_change or 0))
+
+    if prev_pct is not None:
+        prev_pct = float(prev_pct)
+        pct_change = abs(new_pct - prev_pct)
+        if (pct_change > CYCLE_PCT_JUMP_THRESHOLD_PP and
+                btc_change_pct < CYCLE_PCT_STABLE_BTC_MOVE_PCT):
+            log.warning(f"Cycle percentile unstable: {prev_pct:.1f} -> {new_pct:.1f} "
+                        f"on {btc_change_pct:.1f}% BTC move — applying smoothing")
+            smoothed = round(CYCLE_PCT_SMOOTHING_ALPHA * new_pct +
+                             (1 - CYCLE_PCT_SMOOTHING_ALPHA) * prev_pct, 2)
+            state["cycle_percentile_prev"] = smoothed
+            state["cycle_percentile_smoothing_applied"] = True
+            return smoothed
+
+    state["cycle_percentile_prev"] = new_pct
+    state["cycle_percentile_smoothing_applied"] = False
+    return new_pct
 
 
 def percentile_rank(window_values, current_value) -> float:
@@ -545,6 +596,124 @@ def ubi_gap_report(yield_sources: dict, target_monthly: float = UBI_TARGET_MONTH
             "note": "fixed base-case appreciation rate, NOT an annualized "
                     "90d empirical return; yield rate held constant on NAV"}
     return out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# RPL UNSTAKING PROCEEDS — RESTAKE VS SELL GTO
+#
+# The 821 RPL unstaking proceeds can go one of two places: restake against
+# the LEB8 minipools for an incremental commission boost, or sell on Kraken
+# and deploy to sUSDAI for yield on the full proceeds. These are mutually
+# exclusive uses of the same capital — compare net annual value (after gas)
+# and recommend whichever is larger.
+# ────────────────────────────────────────────────────────────────────────────
+def rpl_unstaking_gto_action(state: dict) -> dict:
+    """Compare restaking 821 RPL proceeds against LEB8 minipools (commission
+    boost) vs selling to sUSDAI (yield on full proceeds). Returns the
+    recommended action and the math behind it."""
+    rpl_amount = float(state.get('rpl_unstaking_amount') or
+                       (state.get('rpl_data') or {}).get('megapool_rpl_unstaking', 821))
+    rpl_usd = float(state.get('rpl_usd') or (state.get('prices') or {}).get('rpl_usd', 1.71))
+    eth_usd = float(state.get('eth_usd') or (state.get('prices') or {}).get('eth_usd', 1705))
+    proceeds_usd = rpl_amount * rpl_usd
+
+    # Option A: Restake against LEB8s
+    leb8_count = 3
+    leb8_borrowed_eth = leb8_count * 24  # 72 ETH
+    rpl_data = state.get('rpl_data') or {}
+    current_commission = float(state.get('leb8_commission_rate_current') or
+                               rpl_data.get('leb8_commission_rate_current', 10.5))
+    after_commission = float(state.get('leb8_commission_rate_after_restake') or
+                             rpl_data.get('leb8_commission_rate_after_restake', 10.6))
+    commission_delta_pct = after_commission - current_commission
+    eth_staking_apy = 0.035
+    restake_annual_usd = (commission_delta_pct / 100) * leb8_borrowed_eth * eth_staking_apy * eth_usd
+    gas_cost_usd = float(state.get('eth_gas_cost_usd_estimate', 15.0))
+    restake_net_annual_usd = restake_annual_usd - gas_cost_usd
+    restake_payback_years = gas_cost_usd / max(0.01, restake_annual_usd)
+
+    # Option B: Sell → sUSDAI
+    susdai_apy = float(state.get('yield_apy_susdai', 0.076))
+    susdai_annual_usd = proceeds_usd * susdai_apy
+    susdai_gas_usd = 3.0
+    susdai_net_annual_usd = susdai_annual_usd - susdai_gas_usd
+
+    recommended = 'SELL_TO_SUSDAI' if susdai_net_annual_usd > restake_net_annual_usd else 'RESTAKE_LEB8'
+
+    return {
+        'rpl_amount': rpl_amount,
+        'proceeds_usd': round(proceeds_usd, 2),
+        'option_a_restake': {
+            'commission_delta_pp': round(commission_delta_pct, 2),
+            'annual_value_usd': round(restake_annual_usd, 2),
+            'gas_cost_usd': gas_cost_usd,
+            'net_annual_usd': round(restake_net_annual_usd, 2),
+            'gas_payback_years': round(restake_payback_years, 1)
+        },
+        'option_b_susdai': {
+            'apy': susdai_apy,
+            'annual_value_usd': round(susdai_annual_usd, 2),
+            'gas_cost_usd': susdai_gas_usd,
+            'net_annual_usd': round(susdai_net_annual_usd, 2)
+        },
+        'recommended': recommended,
+        'recommended_reason': (
+            f"sUSDAI yields ${susdai_net_annual_usd:.2f}/yr vs restake ${restake_net_annual_usd:.2f}/yr"
+            if recommended == 'SELL_TO_SUSDAI'
+            else f"Restake yields ${restake_net_annual_usd:.2f}/yr vs sUSDAI ${susdai_net_annual_usd:.2f}/yr"
+        )
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CAPITAL CONFLICT DETECTION
+#
+# Several sections of the advisor independently propose uses for the same
+# pool of capital (e.g. RPL unstaking proceeds routed to sUSDAI in one place
+# and counted toward the carry-trade capital gate in another). This flags
+# when that's happened so the report doesn't silently double-count capital.
+# ────────────────────────────────────────────────────────────────────────────
+def detect_capital_conflicts(state: dict) -> list:
+    """Detect cases where the same capital is allocated to multiple uses.
+    Returns a list of conflict dicts."""
+    conflicts = []
+
+    rpl_data = state.get('rpl_data') or {}
+    rpl_amount = float(state.get('rpl_unstaking_amount') or
+                       rpl_data.get('megapool_rpl_unstaking', 0) or 0)
+    rpl_usd = float(state.get('rpl_usd') or (state.get('prices') or {}).get('rpl_usd', 0) or 0)
+    rpl_proceeds = rpl_amount * rpl_usd
+    carry_threshold = float(state.get('carry_min_viable_eth', 0.926))
+    withdrawal_eth = float(state.get('withdrawal_eth') or
+                           (state.get('validators') or {}).get('withdrawal_address_eth', 0) or 0)
+    minipool_pending = float(state.get('minipool_pending_eth') or
+                             (state.get('minipool_rewards') or {}).get('no_share_eth', 0) or 0)
+    eth_usd = float(state.get('eth_usd') or (state.get('prices') or {}).get('eth_usd', 1705) or 1705)
+    rpl_gto = state.get('rpl_unstaking_gto') or {}
+
+    eth_after_distribute = withdrawal_eth + minipool_pending
+    eth_gap_to_carry = max(0, carry_threshold - eth_after_distribute)
+    rpl_proceeds_eth = rpl_proceeds / eth_usd if eth_usd else 0
+
+    if eth_gap_to_carry > 0 and rpl_proceeds_eth > 0:
+        if rpl_gto.get('recommended') == 'SELL_TO_SUSDAI':
+            conflicts.append({
+                'type': 'RPL_PROCEEDS_DOUBLE_ALLOCATED',
+                'description': (
+                    f"RPL proceeds (~{rpl_proceeds_eth:.3f} ETH equiv / ${rpl_proceeds:.0f}) "
+                    f"directed to sUSDAI but also needed to close carry gate "
+                    f"(gap: {eth_gap_to_carry:.3f} ETH after distribute). "
+                    f"Cannot do both. Decision required: "
+                    f"sUSDAI (${rpl_proceeds * 0.076:.0f}/yr) vs "
+                    f"carry trade activation (est. yield TBD once active)."
+                ),
+                'resolution': (
+                    'SUSDAI_FIRST' if rpl_proceeds * 0.076 > 200
+                    else 'CARRY_FIRST'
+                )
+            })
+
+    return conflicts
 
 
 # ────────────────────────────────────────────────────────────────────────────
