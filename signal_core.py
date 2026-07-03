@@ -342,6 +342,42 @@ def rotation_trigger(btc_gold_pct: float, eth_gold_pct: float) -> dict:
             "avg_gold_pct": round(avg, 1)}
 
 
+ROTATION_PROXIMITY_THRESHOLD_PP = 1.0  # alert when within 1pp of the 5th-pct trigger
+
+
+def rotation_proximity_alert(state: dict):
+    """Warn when either leg of the metals<->crypto dual rotation trigger
+    (rotation_trigger above) is close enough that physical-metals sell
+    orders should be prepped now — execution lag on those orders (1-3
+    days) means waiting for the dual trigger to actually fire is too late.
+    Accepts a crypto_state.json-shaped dict (reads state['ratios']) or a
+    ratios dict directly. Returns None if both legs are >1pp from trigger."""
+    r = state.get("ratios", state) or {}
+    btc_gold_pct = float(state.get('btc_gold_percentile') if state.get('btc_gold_percentile') is not None
+                         else r.get('btc_gold_pct', 100) or 100)
+    eth_gold_pct = float(state.get('eth_gold_percentile') if state.get('eth_gold_percentile') is not None
+                         else r.get('eth_gold_pct', 100) or 100)
+    trigger = 5.0
+
+    btc_gap = btc_gold_pct - trigger
+    eth_gap = eth_gold_pct - trigger
+
+    if eth_gap <= ROTATION_PROXIMITY_THRESHOLD_PP or btc_gap <= ROTATION_PROXIMITY_THRESHOLD_PP:
+        closer_leg = 'ETH/Gold' if eth_gap <= btc_gap else 'BTC/Gold'
+        closer_gap = min(eth_gap, btc_gap)
+        return {
+            'type': 'ROTATION_PROXIMITY',
+            'eth_gold_pct': eth_gold_pct,
+            'btc_gold_pct': btc_gold_pct,
+            'eth_gap_pp': round(eth_gap, 2),
+            'btc_gap_pp': round(btc_gap, 2),
+            'closer_leg': closer_leg,
+            'closer_gap_pp': round(closer_gap, 2),
+            'dual_trigger_fired': btc_gold_pct < trigger and eth_gold_pct < trigger
+        }
+    return None
+
+
 def top_rotation_pct(avg_pct: float) -> float:
     """Crypto→metals+stables rotation share at cycle tops. Continuous ramp
     from 30% at the 85th pct to 90% at the 97th+ (replaces the advisor's
@@ -539,6 +575,60 @@ def carry_trade_recheck_date(withdrawal_eth: float, minipool_pending_eth: float,
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# PERPS / CARRY-TRADE DUAL GATE
+#
+# The old single 0.1 ETH "capital present" gate has been fully superseded by
+# carry_min_eth() (cost-recovery derived — currently ≈0.926 ETH at ~10.95%
+# ARB funding / ~$1,700 ETH). But the carry trade ALSO needs cycle_pct above
+# the 10th pct — below that, directional DCA edge dominates carry yield (see
+# _KELLY_DCA_ANCHORS), so the trade is cycle-suppressed even when the ETH
+# size gate is open. These are two independent conditions with unrelated
+# recheck horizons (one is a capital-accrual projection, the other is a
+# percentile-regime call signal_core cannot forecast precisely) — report
+# them separately rather than collapsing to one recheck date.
+# ────────────────────────────────────────────────────────────────────────────
+CARRY_MIN_VIABLE_ETH = 0.926  # carry_min_eth(10.95, ~1700) at current live
+                              # funding/price — fallback for callers without
+                              # live inputs; prefer a fresh carry_min_eth()
+                              # call when funding/price are available.
+PERPS_CYCLE_GATE_PCT = 10.0   # below this, DCA edge dominates carry yield
+
+
+def cycle_gate_recheck_estimate(cycle_pct: float) -> str:
+    """Coarse recheck band for the cycle-percentile perps gate. Percentile
+    isn't a time series signal_core can forecast precisely, so this is a
+    deliberately wide band, not a point projection."""
+    p = float(cycle_pct)
+    if p >= PERPS_CYCLE_GATE_PCT:
+        return "cleared"
+    if p < 5.0:
+        return "est. 30-60 days"
+    return "est. 7-21 days"
+
+
+def perps_gate_status(withdrawal_eth: float, cycle_pct: float,
+                      eth_gate_recheck_date: str,
+                      carry_min_eth_target: float = CARRY_MIN_VIABLE_ETH,
+                      cycle_gate_threshold: float = PERPS_CYCLE_GATE_PCT) -> dict:
+    """Dual-gate perps/carry-trade status: withdrawal_eth >= carry_min_eth_target
+    AND cycle_pct >= cycle_gate_threshold must BOTH hold before deployment.
+    Returns both gates' current values and recheck estimates separately."""
+    eth_open = withdrawal_eth >= carry_min_eth_target
+    cycle_open = cycle_pct >= cycle_gate_threshold
+    return {
+        "eth_gate_open": eth_open,
+        "eth_gate_current": round(float(withdrawal_eth), 4),
+        "eth_gate_target": carry_min_eth_target,
+        "eth_gate_recheck_date": eth_gate_recheck_date,
+        "cycle_gate_open": cycle_open,
+        "cycle_gate_current": round(float(cycle_pct), 1),
+        "cycle_gate_threshold": cycle_gate_threshold,
+        "cycle_gate_recheck_estimate": cycle_gate_recheck_estimate(cycle_pct),
+        "suppressed": not (eth_open and cycle_open),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # UBI GAP TRACKER
 #
 # months_to_close_base_case previously annualized the empirical 90d median
@@ -683,7 +773,7 @@ def detect_capital_conflicts(state: dict) -> list:
                        rpl_data.get('megapool_rpl_unstaking', 0) or 0)
     rpl_usd = float(state.get('rpl_usd') or (state.get('prices') or {}).get('rpl_usd', 0) or 0)
     rpl_proceeds = rpl_amount * rpl_usd
-    carry_threshold = float(state.get('carry_min_viable_eth', 0.926))
+    carry_threshold = float(state.get('carry_min_viable_eth', CARRY_MIN_VIABLE_ETH))
     withdrawal_eth = float(state.get('withdrawal_eth') or
                            (state.get('validators') or {}).get('withdrawal_address_eth', 0) or 0)
     minipool_pending = float(state.get('minipool_pending_eth') or
@@ -710,6 +800,18 @@ def detect_capital_conflicts(state: dict) -> list:
                 'resolution': (
                     'SUSDAI_FIRST' if rpl_proceeds * 0.076 > 200
                     else 'CARRY_FIRST'
+                ),
+                # A resolution computed here is a recommendation, not a standing
+                # order — real capital shouldn't move on an auto-resolved
+                # conflict without the user explicitly locking it in (see
+                # manage_state.py --confirm). Downstream renders must show
+                # both options until confirmed, per this flag.
+                'requires_confirmation': True,
+                'confirmation_key': 'carry_first_confirmed',
+                'confirmation_prompt': (
+                    f"Confirm CARRY_FIRST routing of ~${rpl_proceeds:.0f} RPL proceeds to carry gate "
+                    "instead of sUSDAI. Reply 'confirm carry' to lock in routing. "
+                    "This decision persists until manually overridden."
                 )
             })
 
