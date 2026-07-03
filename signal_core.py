@@ -302,6 +302,47 @@ def top_rotation_pct(avg_pct: float) -> float:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# YIELD OPPORTUNITY RISK-ADJUSTED SCORING
+#
+# score = APY * ln(TVL_millions)**1.5 * audit_factor — TVL exponent raised
+# from 1.0 to 1.5 because the plain-log version was APY-dominated: it let
+# small unaudited pools outscore large audited ones by 3-4x on APY alone.
+# Two gates sit in front of the score:
+#   1. TVL floor — below it, WATCH LIST only, never primary allocation.
+#   2. Audit floor for primary allocation above $500 — even a good score
+#      can't carry an unaudited protocol into a >$500 primary slot.
+# ────────────────────────────────────────────────────────────────────────────
+PRIMARY_TVL_FLOOR_USD = 500.0
+PRIMARY_MIN_TVL_M = 75.0     # TVL floor (millions) for allocations > $500
+SECONDARY_MIN_TVL_M = 25.0   # TVL floor (millions) for allocations <= $500
+PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR = 0.8
+
+
+def score_yield_opportunity(apy_pct: float, tvl_millions: float,
+                            audit_factor: float) -> float:
+    """Risk-adjusted score: APY * ln(TVL_millions)**1.5 * audit_factor.
+    Callers should gate on TVL floors (PRIMARY_MIN_TVL_M / SECONDARY_MIN_TVL_M)
+    and PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR before treating a high score as a
+    primary-allocation recommendation — the score alone doesn't encode those
+    hard gates."""
+    if tvl_millions is None or tvl_millions <= 1:
+        return 0.0
+    return round(float(apy_pct) * (math.log(float(tvl_millions)) ** 1.5) * float(audit_factor), 2)
+
+
+def eligible_for_primary(allocation_usd: float, tvl_millions: float,
+                         audit_factor: float) -> bool:
+    """Gate 1 (TVL floor, tiered by allocation size) + Gate 2 (audit floor
+    above the $500 primary-allocation threshold)."""
+    floor = PRIMARY_MIN_TVL_M if allocation_usd > PRIMARY_TVL_FLOOR_USD else SECONDARY_MIN_TVL_M
+    if (tvl_millions or 0) < floor:
+        return False
+    if allocation_usd > PRIMARY_TVL_FLOOR_USD and audit_factor < PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR:
+        return False
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # CYCLE-CONDITIONAL CAPITAL ROUTER
 #
 # dca_frac is Kelly-derived, not an arbitrary step function. At each cycle
@@ -314,6 +355,7 @@ def top_rotation_pct(avg_pct: float) -> float:
 # Calibration points (E[90d yield] = 12% APY / 4 = 3.0% per 90d, held fixed
 # as the "best available yield" reference; E[90d DCA] from the empirical
 # 90d return table above at each percentile):
+#   pct=0:   E[90d DCA]=+60.0% (max historical) vs E[90d yield]=+3.0% -> DCA Kelly=96.9%
 #   pct=7:   E[90d DCA]=+23.4% vs E[90d yield]=+3.0% -> DCA Kelly=88.6%
 #   pct=15:  E[90d DCA]=+18.0% vs E[90d yield]=+3.0% -> DCA Kelly=85.7%
 #   pct=35:  E[90d DCA]=+8.0%  vs E[90d yield]=+3.0% -> DCA Kelly=72.7%
@@ -322,8 +364,18 @@ def top_rotation_pct(avg_pct: float) -> float:
 # Piecewise-linear interpolation between these anchors. The prior hardcoded
 # 40%/25% breakpoints at the 35th/50th pct underweighted DCA relative to
 # this math (Kelly supports ~73% DCA at the 35th pct, not 40%).
+#
+# The 0th-pct anchor used to be missing, so cycle_pct <= 7 flat-clamped at
+# 88.6% — which silently contradicted the "100% DCA below 15th" framing used
+# elsewhere (e.g. the capital-router fallback label). There is no discontinuity
+# to fix in the math itself (Kelly was never actually 100% anywhere), but the
+# curve is now anchored all the way to 0 so nothing downstream can describe it
+# as flat/100% below any threshold. Kelly at 0th pct: (0.60 - 0.01125) /
+# (0.60 - 0.01125 + 0.03 - 0.01125) = 96.9% — still short of 100%, which is
+# correct Kelly behavior (yield always retains some edge as a hedge).
 # ────────────────────────────────────────────────────────────────────────────
-_KELLY_DCA_ANCHORS = [(7.0, 0.886), (15.0, 0.857), (35.0, 0.727), (50.0, 0.500), (65.0, 0.0)]
+_KELLY_DCA_ANCHORS = [(0.0, 0.969), (7.0, 0.886), (15.0, 0.857), (35.0, 0.727),
+                      (50.0, 0.500), (65.0, 0.0)]
 
 
 def _kelly_dca_fraction(cycle_pct: float, best_yield_apy: float = 12.0) -> float:
