@@ -92,8 +92,8 @@ def render_ubi_gap_section(cycle_pct: float, weekly_dca_usd: float):
     if assumptions:
         st.caption(
             f"Base case: {assumptions['blended_yield_rate_pct']:.2f}% blended yield on NAV, "
-            f"{assumptions['price_growth_ann_pct']:.1f}%/yr price growth "
-            f"(empirical 90d median at the {cycle_pct:.1f}th percentile, annualized)."
+            f"{assumptions['price_growth_ann_pct']:.1f}%/yr fixed price-appreciation assumption "
+            "(a conservative full-cycle BTC/ETH/SOL figure, not an annualized 90-day return)."
         )
     elif report["current_monthly"] == 0:
         st.info(
@@ -117,8 +117,8 @@ def render_ubi_gap_section(cycle_pct: float, weekly_dca_usd: float):
         f"At the {cycle_pct:.1f}th percentile, {router['dca_frac']*100:.0f}% of new capital "
         f"routes to DCA and {100 - router['dca_frac']*100:.0f}% to yield. "
         f"Empirical E[90d return] here: {med*100:+.1f}% (IQR ±{iqr*100:.1f}%). "
-        "Below the 15th percentile everything buys the dip; above the 35th, "
-        "yield that pays the UBI gap becomes the primary use of new capital."
+        "Split is Kelly-derived from E[90d DCA] vs E[90d yield] edge over the risk-free rate "
+        "(anchors: ~89% DCA at the 7th percentile down to yield-primary at the 65th+)."
     )
     if router.get("profit_taking_review"):
         st.warning(

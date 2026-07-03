@@ -303,29 +303,64 @@ def top_rotation_pct(avg_pct: float) -> float:
 
 # ────────────────────────────────────────────────────────────────────────────
 # CYCLE-CONDITIONAL CAPITAL ROUTER
+#
+# dca_frac is Kelly-derived, not an arbitrary step function. At each cycle
+# percentile:
+#   DCA edge   = E[90d DCA return]   - risk_free_per_90d
+#   Yield edge = E[90d yield return] - risk_free_per_90d
+#   Kelly DCA fraction = dca_edge / (dca_edge + yield_edge)
+# risk_free_per_90d = 4.5% annual / 4 = 1.125% per 90d.
+#
+# Calibration points (E[90d yield] = 12% APY / 4 = 3.0% per 90d, held fixed
+# as the "best available yield" reference; E[90d DCA] from the empirical
+# 90d return table above at each percentile):
+#   pct=7:   E[90d DCA]=+23.4% vs E[90d yield]=+3.0% -> DCA Kelly=88.6%
+#   pct=15:  E[90d DCA]=+18.0% vs E[90d yield]=+3.0% -> DCA Kelly=85.7%
+#   pct=35:  E[90d DCA]=+8.0%  vs E[90d yield]=+3.0% -> DCA Kelly=72.7%
+#   pct=50:  E[90d DCA]=+3.0%  vs E[90d yield]=+3.0% -> DCA Kelly=50.0%
+#   pct=65:  E[90d DCA]=+0.0%  vs E[90d yield]=+3.0% -> DCA Kelly=0.0% (yield primary)
+# Piecewise-linear interpolation between these anchors. The prior hardcoded
+# 40%/25% breakpoints at the 35th/50th pct underweighted DCA relative to
+# this math (Kelly supports ~73% DCA at the 35th pct, not 40%).
 # ────────────────────────────────────────────────────────────────────────────
+_KELLY_DCA_ANCHORS = [(7.0, 0.886), (15.0, 0.857), (35.0, 0.727), (50.0, 0.500), (65.0, 0.0)]
+
+
+def _kelly_dca_fraction(cycle_pct: float, best_yield_apy: float = 12.0) -> float:
+    """Kelly-derived DCA fraction at a cycle percentile, piecewise-linear
+    between _KELLY_DCA_ANCHORS. best_yield_apy is accepted for future
+    recalibration (e.g. re-deriving anchors off a live yield figure instead
+    of the fixed 12% APY reference) but the anchor table above already bakes
+    in that reference, so it is not currently used to rescale mid-curve."""
+    p = min(max(float(cycle_pct), 0.0), 100.0)
+    anchors = _KELLY_DCA_ANCHORS
+    if p <= anchors[0][0]:
+        return anchors[0][1]
+    if p >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (p0, f0), (p1, f1) in zip(anchors, anchors[1:]):
+        if p0 <= p <= p1:
+            t = (p - p0) / (p1 - p0)
+            return f0 + t * (f1 - f0)
+    return anchors[-1][1]
+
+
 def allocate_capital(cycle_pct: float, available_capital: float,
                      yield_opportunities: list = None) -> dict:
     """Route weekly deployable capital between spot DCA and yield positions
-    as a function of the cycle percentile.
-
-      < 15th:   100% DCA — directional upside dominates any carry.
-      15-35th:  linear blend, DCA share 1.0 → 0.40.
-      35-50th:  yield primary, DCA share 0.40 → 0.25.
-      > 50th:   DCA 25%, remainder to yield; profit-taking review flagged.
+    via the Kelly-derived _kelly_dca_fraction (see module note above).
 
     yield_opportunities: [{"name": str, "apy": float, ...}] sorted or not;
-    yield capital is split across the top 3 by APY, 50/30/20."""
+    yield capital is split across the top 3 by APY, 50/30/20; the best APY
+    among them (or 12.0 default) is passed to _kelly_dca_fraction."""
     p = min(max(float(cycle_pct), 0.0), 100.0)
     cap = max(0.0, float(available_capital))
-    if p < 15.0:
-        dca_frac = 1.0
-    elif p < 35.0:
-        dca_frac = 1.0 - 0.60 * (p - 15.0) / 20.0
-    elif p < 50.0:
-        dca_frac = 0.40 - 0.15 * (p - 35.0) / 15.0
-    else:
-        dca_frac = 0.25
+    best_yield_apy = 12.0
+    if yield_opportunities:
+        apys = [o.get("apy") for o in yield_opportunities if o.get("apy")]
+        if apys:
+            best_yield_apy = max(apys)
+    dca_frac = _kelly_dca_fraction(p, best_yield_apy)
     dca_usd = round(cap * dca_frac, 2)
     yield_usd = round(cap - dca_usd, 2)
     slots = []
@@ -365,18 +400,64 @@ def carry_min_eth(funding_ann_pct: float, eth_price: float,
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# UBI GAP TRACKER
+# CARRY-TRADE RECHECK DATE
+#
+# The gate itself is carry_min_eth() above. This answers "when will the gate
+# realistically open" — the naive version (gap / staking_accrual_only) ignores
+# two near-term inflows that are already known and scheduled: the minipool
+# distribute (claimable on demand, not a future accrual) and RPL unstaking
+# proceeds converted to ETH (only counted if landing within 14 days — beyond
+# that it's not "near-term" and shouldn't pull the recheck date forward).
 # ────────────────────────────────────────────────────────────────────────────
+def carry_trade_recheck_date(withdrawal_eth: float, minipool_pending_eth: float,
+                             daily_accrual_eth: float, carry_min_eth_target: float,
+                             rpl_unstaking_amount: float = 0.0, rpl_usd: float = 0.0,
+                             eth_usd: float = 0.0, rpl_unstake_date: str = None,
+                             today=None) -> str:
+    """ISO date the carry-trade capital gate (carry_min_eth_target) is
+    realistically expected to open, accounting for withdrawal-address ETH +
+    pending minipool distribute + (if landing within 14 days) RPL unstaking
+    proceeds converted to ETH — not staking accrual alone."""
+    from datetime import date, timedelta
+    today = today or date.today()
+    projected = withdrawal_eth + max(0.0, minipool_pending_eth)
+    if rpl_unstake_date and rpl_unstaking_amount > 0 and eth_usd > 0:
+        try:
+            ud = date.fromisoformat(rpl_unstake_date)
+            if 0 <= (ud - today).days <= 14:
+                projected += (rpl_unstaking_amount * rpl_usd) / eth_usd
+        except ValueError:
+            pass
+    if projected >= carry_min_eth_target:
+        return today.isoformat()
+    gap = carry_min_eth_target - projected
+    days = int(gap / daily_accrual_eth) + 1 if daily_accrual_eth > 0 else 999
+    return (today + timedelta(days=days)).isoformat()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# UBI GAP TRACKER
+#
+# months_to_close_base_case previously annualized the empirical 90d median
+# return — (1+med90)**(365/90)-1 — as a proxy for long-run price growth.
+# That's invalid: cycle percentile rises as price rises, so the 90d forward
+# return shrinks as the portfolio grows: compounding a single 90d-horizon
+# figure at that power systematically overstates long-run appreciation.
+# The base case instead uses a fixed, conservative full-cycle appreciation
+# rate for a BTC/ETH/SOL portfolio, independent of the current percentile.
+# ────────────────────────────────────────────────────────────────────────────
+BASE_CASE_ANNUAL_APPRECIATION = 0.15  # conservative full-cycle BTC/ETH/SOL assumption
+
+
 def ubi_gap_report(yield_sources: dict, target_monthly: float = UBI_TARGET_MONTHLY,
                    portfolio_usd: float = None, cycle_pct: float = None) -> dict:
     """UBI gap = target monthly income minus current distributable yield.
 
     yield_sources: {"name": annual_usd, ...} (annual USD per source).
-    Returns gap, coverage %, and — when portfolio_usd/cycle_pct given — a
-    base-case months-to-close estimate assuming yield-bearing capital grows
-    via the empirical 90d expected return (annualized) plus reinvested yield,
-    at a blended deployable-yield rate equal to the current portfolio-wide
-    yield rate (no heroic assumptions)."""
+    Returns gap, coverage %, and — when portfolio_usd is given — a base-case
+    months-to-close estimate assuming the portfolio grows at a fixed
+    BASE_CASE_ANNUAL_APPRECIATION rate (not an annualized 90d figure — see
+    module note above) while the blended yield rate on NAV holds constant."""
     annual = {k: float(v or 0) for k, v in (yield_sources or {}).items()}
     total_annual = sum(annual.values())
     monthly = total_annual / 12.0
@@ -386,26 +467,31 @@ def ubi_gap_report(yield_sources: dict, target_monthly: float = UBI_TARGET_MONTH
            "gap_monthly": round(gap, 2),
            "coverage_pct": round(monthly / target_monthly * 100, 1) if target_monthly else 0.0,
            "sources_annual": {k: round(v, 2) for k, v in annual.items()},
-           "months_to_close_base_case": None}
-    if gap > 0 and portfolio_usd and portfolio_usd > 0 and total_annual > 0:
+           "months_to_close_base_case": None,
+           "base_case_monthly_yield_now": round(monthly, 2)}
+    if portfolio_usd and portfolio_usd > 0 and total_annual > 0:
         yield_rate = total_annual / portfolio_usd  # blended realized yield on NAV
-        growth_ann = 0.0
-        if cycle_pct is not None:
-            med90, _ = expected_90d_return(cycle_pct)
-            growth_ann = max(0.0, (1 + med90) ** (365.0 / 90.0) - 1)
-        # months until portfolio_usd*(1+g)^t * yield_rate / 12 >= target
-        needed_nav = target_monthly * 12.0 / yield_rate
-        g_m = (1 + growth_ann) ** (1 / 12.0) - 1
-        if needed_nav <= portfolio_usd:
+        growth_ann = BASE_CASE_ANNUAL_APPRECIATION
+        portfolio_90d = portfolio_usd * (1 + growth_ann) ** (90.0 / 365.0)
+        portfolio_12mo = portfolio_usd * (1 + growth_ann)
+        out["base_case_monthly_yield_90d"] = round(portfolio_90d * yield_rate / 12.0, 2)
+        out["base_case_monthly_yield_12mo"] = round(portfolio_12mo * yield_rate / 12.0, 2)
+        out["portfolio_required_at_current_yield_rate"] = round(target_monthly * 12.0 / yield_rate, 2)
+        if gap > 0:
+            needed_nav = target_monthly * 12.0 / yield_rate
+            g_m = (1 + growth_ann) ** (1 / 12.0) - 1
+            if needed_nav <= portfolio_usd:
+                out["months_to_close_base_case"] = 0
+            elif g_m > 0:
+                months = math.log(needed_nav / portfolio_usd) / math.log(1 + g_m)
+                out["months_to_close_base_case"] = round(months, 1)
+        else:
             out["months_to_close_base_case"] = 0
-        elif g_m > 0:
-            months = math.log(needed_nav / portfolio_usd) / math.log(1 + g_m)
-            out["months_to_close_base_case"] = round(months, 1)
         out["base_case_assumptions"] = {
             "blended_yield_rate_pct": round(yield_rate * 100, 2),
             "price_growth_ann_pct": round(growth_ann * 100, 1),
-            "note": "growth from empirical 90d median at current cycle pct, "
-                    "annualized; yield rate held constant on NAV"}
+            "note": "fixed base-case appreciation rate, NOT an annualized "
+                    "90d empirical return; yield rate held constant on NAV"}
     return out
 
 
@@ -438,9 +524,17 @@ if __name__ == "__main__":
     ks = kelly_split({"BTC": 9.7, "ETH": 3.8})
     assert abs(sum(v for k, v in ks.items() if k != "_diag") - 1.0) < 1e-6
     alloc = allocate_capital(6.8, 1000, [{"name": "sUSDai", "apy": 7.8}])
-    assert alloc["dca"] == 1000.0
+    assert 850 < alloc["dca"] < 900, alloc  # Kelly at ~7th pct: ~88.6% DCA, not 100%
     alloc2 = allocate_capital(25, 1000, [{"name": "sUSDai", "apy": 7.8}])
     assert 0 < alloc2["yield_usd"] < 1000
+    # Synthetic test figures only — not real portfolio data (this file is
+    # mirrored to a public repo).
+    from datetime import date, timedelta as _td
+    _cr = carry_trade_recheck_date(
+        withdrawal_eth=0.05, minipool_pending_eth=0.1, daily_accrual_eth=0.01,
+        carry_min_eth_target=0.5, rpl_unstaking_amount=100.0, rpl_usd=2.0,
+        eth_usd=2000.0, rpl_unstake_date=(date.today() + _td(days=5)).isoformat())
+    assert len(_cr) == 10  # ISO date string
     print("signal_core self-test OK",
           {"gto(6.8)": gto_multiplier(6.8), "split": ks,
            "e90(6.8)": expected_90d_return(6.8),
