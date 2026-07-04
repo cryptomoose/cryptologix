@@ -541,6 +541,7 @@ def allocate_capital(cycle_pct: float, available_capital: float,
 
 # ────────────────────────────────────────────────────────────────────────────
 # CARRY-TRADE MINIMUM VIABLE SIZE (replaces the arbitrary 0.1 ETH gate)
+# Deferred — re-enable via carry_trade_enabled flag at cycle pct > 35th
 # ────────────────────────────────────────────────────────────────────────────
 def carry_min_eth(funding_ann_pct: float, eth_price: float,
                   fixed_costs_usd: float = 12.0,
@@ -569,6 +570,7 @@ def carry_min_eth(funding_ann_pct: float, eth_price: float,
 # distribute (claimable on demand, not a future accrual) and RPL unstaking
 # proceeds converted to ETH (only counted if landing within 14 days — beyond
 # that it's not "near-term" and shouldn't pull the recheck date forward).
+# Deferred — re-enable via carry_trade_enabled flag at cycle pct > 35th
 # ────────────────────────────────────────────────────────────────────────────
 def carry_trade_recheck_date(withdrawal_eth: float, minipool_pending_eth: float,
                              daily_accrual_eth: float, carry_min_eth_target: float,
@@ -633,6 +635,7 @@ def carry_trade_recheck_date(withdrawal_eth: float, minipool_pending_eth: float,
 # recheck horizons (one is a capital-accrual projection, the other is a
 # percentile-regime call signal_core cannot forecast precisely) — report
 # them separately rather than collapsing to one recheck date.
+# Deferred — re-enable via carry_trade_enabled flag at cycle pct > 35th
 # ────────────────────────────────────────────────────────────────────────────
 CARRY_MIN_VIABLE_ETH = 0.926  # carry_min_eth(10.95, ~1700) at current live
                               # funding/price — fallback for callers without
