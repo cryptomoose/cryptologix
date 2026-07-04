@@ -23,6 +23,7 @@ import math
 import hashlib
 import os
 import logging
+from datetime import date
 
 log = logging.getLogger(__name__)
 
@@ -503,16 +504,37 @@ def allocate_capital(cycle_pct: float, available_capital: float,
     dca_usd = round(cap * dca_frac, 2)
     yield_usd = round(cap - dca_usd, 2)
     slots = []
+    filtered_protocols = []
     if yield_usd > 0 and yield_opportunities:
-        top = sorted(yield_opportunities,
-                     key=lambda o: -(o.get("apy") or 0))[:3]
+        # Gate on audit_factor/tvl_m BEFORE ranking by APY — otherwise a high
+        # APY on an unaudited or thin-TVL pool can win a primary slot on
+        # yield alone (see eligible_for_primary / PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR
+        # above). Missing audit_factor is NOT eligible-by-default: absence of
+        # data is not evidence of an audit.
+        eligible = []
+        for o in yield_opportunities:
+            tvl_m = o.get("tvl_m")
+            audit_factor = o.get("audit_factor")
+            if audit_factor is None or tvl_m is None:
+                filtered_protocols.append({"opportunity": o.get("name") or o.get("pool", "?"),
+                                           "apy": o.get("apy"), "audit_factor": audit_factor,
+                                           "tvl_m": tvl_m, "reason": "missing audit_factor/tvl_m"})
+                continue
+            if eligible_for_primary(yield_usd, float(tvl_m), float(audit_factor)):
+                eligible.append(o)
+            else:
+                filtered_protocols.append({"opportunity": o.get("name") or o.get("pool", "?"),
+                                           "apy": o.get("apy"), "audit_factor": audit_factor,
+                                           "tvl_m": tvl_m, "reason": "below audit/TVL floor"})
+        top = sorted(eligible, key=lambda o: -(o.get("apy") or 0))[:3]
         shares = [0.5, 0.3, 0.2][:len(top)]
-        norm = sum(shares)
+        norm = sum(shares) if top else 1
         for o, s in zip(top, shares):
             slots.append({"opportunity": o.get("name") or o.get("pool", "?"),
                           "apy": o.get("apy"),
                           "amount": round(yield_usd * s / norm, 2)})
     return {"dca": dca_usd, "yield_usd": yield_usd, "yield_slots": slots,
+            "filtered_protocols": filtered_protocols,
             "dca_frac": round(dca_frac, 4),
             "profit_taking_review": p >= 50.0}
 
@@ -552,26 +574,51 @@ def carry_trade_recheck_date(withdrawal_eth: float, minipool_pending_eth: float,
                              daily_accrual_eth: float, carry_min_eth_target: float,
                              rpl_unstaking_amount: float = 0.0, rpl_usd: float = 0.0,
                              eth_usd: float = 0.0, rpl_unstake_date: str = None,
-                             today=None) -> str:
-    """ISO date the carry-trade capital gate (carry_min_eth_target) is
-    realistically expected to open, accounting for withdrawal-address ETH +
-    pending minipool distribute + (if landing within 14 days) RPL unstaking
-    proceeds converted to ETH — not staking accrual alone."""
+                             carry_first_confirmed: bool = False,
+                             today=None) -> dict:
+    """Recheck date(s) for the carry-trade capital gate (carry_min_eth_target).
+
+    RPL unstaking proceeds are only a near-term inflow toward this gate if the
+    user has actually confirmed routing them there (carry_first_confirmed) —
+    otherwise they're just as likely to go to sUSDAI, and counting them here
+    while sUSDAI also expects them double-counts the same capital (see
+    detect_capital_conflicts). So this always computes both branches:
+
+    - conservative_date: withdrawal ETH + minipool distribute only, accrual
+      thereafter — the correct default while routing is unconfirmed
+      (the "SUSDAI branch"), since it doesn't assume RPL proceeds land here.
+    - carry_first_date: the above PLUS RPL unstaking proceeds converted to
+      ETH, if landing within 14 days — the "CARRY_FIRST branch", valid only
+      once the user has confirmed that routing.
+
+    recheck_date is carry_first_date when confirmed, else conservative_date."""
     from datetime import date, timedelta
     today = today or date.today()
-    projected = withdrawal_eth + max(0.0, minipool_pending_eth)
+    base_projected = withdrawal_eth + max(0.0, minipool_pending_eth)
+    carry_first_projected = base_projected
     if rpl_unstake_date and rpl_unstaking_amount > 0 and eth_usd > 0:
         try:
             ud = date.fromisoformat(rpl_unstake_date)
             if 0 <= (ud - today).days <= 14:
-                projected += (rpl_unstaking_amount * rpl_usd) / eth_usd
+                carry_first_projected += (rpl_unstaking_amount * rpl_usd) / eth_usd
         except ValueError:
             pass
-    if projected >= carry_min_eth_target:
-        return today.isoformat()
-    gap = carry_min_eth_target - projected
-    days = int(gap / daily_accrual_eth) + 1 if daily_accrual_eth > 0 else 999
-    return (today + timedelta(days=days)).isoformat()
+
+    def _date_for(projected):
+        if projected >= carry_min_eth_target:
+            return today.isoformat()
+        gap = carry_min_eth_target - projected
+        days = int(gap / daily_accrual_eth) + 1 if daily_accrual_eth > 0 else 999
+        return (today + timedelta(days=days)).isoformat()
+
+    conservative_date = _date_for(base_projected)
+    carry_first_date = _date_for(carry_first_projected)
+    return {
+        "conservative_date": conservative_date,
+        "carry_first_date": carry_first_date,
+        "recheck_date": carry_first_date if carry_first_confirmed else conservative_date,
+        "branch": "carry_first" if carry_first_confirmed else "dual",
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -819,6 +866,153 @@ def detect_capital_conflicts(state: dict) -> list:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# SATELLITE ANALYSIS — LIT (Lighter) + VVV (Venice AI)
+#
+# Daily GTO monitoring for the two $500-max satellite positions tracked in
+# candidate_investments.json. Not core capital — must never influence the
+# BTC/ETH/SOL DCA split or capital router above. Reads prices from either a
+# flat dict (lit_usd/vvv_usd/diem_usd keys) or a crypto_state.json-shaped
+# dict (state['prices'][...]), matching the accessor pattern used elsewhere
+# in this file (e.g. rpl_unstaking_gto_action).
+# ────────────────────────────────────────────────────────────────────────────
+LIT_ENTRY_TRIGGER = 1.50
+VVV_ENTRY_TRIGGER = 10.0
+SATELLITE_POSITION_USD = 500.0
+
+
+def satellite_analysis(state: dict) -> dict:
+    """Daily GTO analysis for the LIT and VVV satellite positions. Returns
+    {"lit": {...}, "vvv": {...}} — price vs. entry trigger, yield mechanics,
+    supply/unlock risk flags, and a GTO action string for each."""
+    prices = state.get("prices") or {}
+
+    def _get(key, default=0):
+        v = state.get(key)
+        if v is None:
+            v = prices.get(key, default)
+        return v if v is not None else default
+
+    # ── LIT ──────────────────────────────────────────────────────────────
+    lit_price = float(_get("lit_usd") or 0)
+    lit_change_24h = float(_get("lit_24h_change_pct") or 0)
+    lit_change_7d = float(_get("lit_7d_change_pct") or 0)
+
+    lit_days_to_unlock = (date(2026, 12, 30) - date.today()).days  # major 750M-token unlock
+    lit_unlock_monthly_usd = 13_500_000 * lit_price if lit_price else 0  # post-cliff run rate
+    # Q1 2026 buybacks: $14.6M over 3 months
+    lit_buyback_monthly_usd = float(state.get("lit_monthly_buyback_usd") or (14_600_000 / 3))
+
+    lit_above_trigger = lit_price > LIT_ENTRY_TRIGGER if lit_price else True
+    lit_pct_from_trigger = ((lit_price - LIT_ENTRY_TRIGGER) / LIT_ENTRY_TRIGGER * 100) if lit_price else 0.0
+
+    # LLP yield estimate: perp-DEX LP vaults have historically run ~15-25%
+    # APY, but LLP is a direct counterparty to trader PnL (see Oct 2025
+    # cascade) — use a conservative 12% placeholder pending a live feed.
+    lit_llp_apy_estimate = 0.12
+    lit_llp_usdc_per_lit = 10  # 1 staked LIT unlocks 10 USDC of LLP exposure
+    lit_llp_usdc_exposure = (SATELLITE_POSITION_USD / lit_price * lit_llp_usdc_per_lit) if lit_price else 0
+    lit_llp_annual_per_500 = lit_llp_usdc_exposure * lit_llp_apy_estimate
+
+    lit_net_supply_pressure = lit_unlock_monthly_usd - lit_buyback_monthly_usd
+
+    lit = {
+        "name": "Lighter (LIT)",
+        "price": lit_price,
+        "trigger": LIT_ENTRY_TRIGGER,
+        "above_trigger": lit_above_trigger,
+        "pct_from_trigger": round(lit_pct_from_trigger, 1),
+        "status": "WATCH" if lit_above_trigger else "ENTRY_SIGNAL",
+        "change_24h_pct": round(lit_change_24h, 2),
+        "change_7d_pct": round(lit_change_7d, 2),
+        "staking_apy_target": 0.06,
+        "staking_note": "LIT-denominated from ecosystem reserve — NOT revenue yield",
+        "llp_usdc_exposure_per_500": round(lit_llp_usdc_exposure, 2),
+        "llp_yield_estimate_annual": round(lit_llp_annual_per_500, 2),
+        "llp_note": f"$500 position -> LLP access on ~${lit_llp_usdc_exposure:,.0f} USDC at ~{lit_llp_apy_estimate*100:.0f}% est.",
+        "days_to_major_unlock": lit_days_to_unlock,
+        "unlock_monthly_usd_post_cliff": round(lit_unlock_monthly_usd, 0),
+        "buyback_monthly_usd_est": round(lit_buyback_monthly_usd, 0),
+        "net_supply_pressure_monthly": round(lit_net_supply_pressure, 0),
+        "gto_action": (
+            f"WAIT — enter post-December 2026 unlock if volume sticky and price holds >$1. "
+            f"Currently {lit_pct_from_trigger:+.1f}% from ${LIT_ENTRY_TRIGGER:.2f} trigger."
+            if lit_above_trigger else
+            f"ENTRY SIGNAL — price below ${LIT_ENTRY_TRIGGER:.2f} trigger. "
+            "Stake immediately for LLP access. $500 max."
+        ),
+        "risk_flags": [
+            f"Major unlock in ~{lit_days_to_unlock} days: 750M LIT (75% supply) hits market",
+            (f"Net monthly supply pressure post-unlock: ${lit_net_supply_pressure:,.0f}"
+             if lit_price else "Price unavailable — net supply pressure not computable"),
+            "Staking yield is reserve-funded LIT dilution, not protocol revenue",
+            "Robinhood volume not yet confirmed as sticky (90-day gas subsidy active)",
+        ],
+    }
+
+    # ── VVV ──────────────────────────────────────────────────────────────
+    vvv_price = float(_get("vvv_usd") or 0)
+    vvv_above_trigger = vvv_price > VVV_ENTRY_TRIGGER if vvv_price else True
+    vvv_pct_from_trigger = ((vvv_price - VVV_ENTRY_TRIGGER) / VVV_ENTRY_TRIGGER * 100) if vvv_price else 0.0
+
+    # DIEM: not on CoinGecko, priced off its Base/Aerodrome pool by the
+    # collector (crypto_data_collector.fetch_prices -> state['prices']['diem_usd']).
+    diem_price = float(_get("diem_usd") or 0)
+    diem_payback_years = (diem_price / 365.0) if diem_price else None
+    # vvv_per_diem_ratio: rough implied cost (in VVV) to mint $1/day of DIEM,
+    # backed out from DIEM's market price vs VVV's spot price — the protocol
+    # doesn't publish this ratio directly, so DIEM's market price is used as
+    # the equilibrium proxy.
+    vvv_per_diem_ratio = (diem_price / vvv_price) if (diem_price and vvv_price) else None
+
+    vvv_tokens = (SATELLITE_POSITION_USD / vvv_price) if vvv_price else 0
+    diem_mintable = (vvv_tokens / vvv_per_diem_ratio) if vvv_per_diem_ratio else 0
+    diem_annual_value = diem_mintable * 365
+    staking_apy_vvv = float(state.get("vvv_staking_apy") or 0.10)  # current emissions-based estimate
+    staking_annual_value = SATELLITE_POSITION_USD * staking_apy_vvv
+
+    vvv = {
+        "name": "Venice AI (VVV)",
+        "price": vvv_price,
+        "trigger": VVV_ENTRY_TRIGGER,
+        "above_trigger": vvv_above_trigger,
+        "pct_from_trigger": round(vvv_pct_from_trigger, 1),
+        "status": "WATCH" if vvv_above_trigger else "ENTRY_SIGNAL",
+        "diem_price_usd": diem_price,
+        "diem_payback_years": round(diem_payback_years, 1) if diem_payback_years is not None else None,
+        "position_500_vvv_tokens": round(vvv_tokens, 2),
+        "position_500_diem_mintable": round(diem_mintable, 4),
+        "position_500_diem_annual_usd": round(diem_annual_value, 2),
+        "position_500_staking_annual_usd": round(staking_annual_value, 2),
+        "position_500_total_annual_usd": round(diem_annual_value + staking_annual_value, 2),
+        "supply_burned_pct": 42.0,
+        "emissions_annual": 6_000_000,
+        "gto_action": (
+            (
+                f"WATCH — {vvv_pct_from_trigger:+.1f}% above ${VVV_ENTRY_TRIGGER:.0f} trigger. "
+                + (f"DIEM payback {diem_payback_years:.1f}yr — enters favorable range <2.75yr at <${VVV_ENTRY_TRIGGER:.0f}. "
+                   if diem_payback_years is not None else "DIEM price unavailable. ")
+                + f"Set limit order at ${VVV_ENTRY_TRIGGER - 0.5:.2f}."
+            ) if vvv_above_trigger else (
+                f"ENTRY SIGNAL — below ${VVV_ENTRY_TRIGGER:.0f} trigger. "
+                f"Buy $500, stake 100% immediately. "
+                + (f"Lock sVVV -> mint {diem_mintable:.4f} DIEM -> sell on Aerodrome for "
+                   f"~${diem_annual_value:.2f}/yr cash yield + ${staking_annual_value:.2f}/yr staking."
+                   if diem_mintable else "DIEM price unavailable for payback calc.")
+            )
+        ),
+        "risk_flags": [
+            "Venice company holds 35% genesis supply — concentrated, no governance rights for holders",
+            "10M tokens vesting through 2026 — team selling pressure",
+            (f"DIEM payback {diem_payback_years:.1f}yr at current price — unattractive above ${VVV_ENTRY_TRIGGER:.0f}"
+             if diem_payback_years is not None else "DIEM price unavailable — payback not computable"),
+            "Privacy AI moat contestable — major labs investing in privacy products",
+        ],
+    }
+
+    return {"lit": lit, "vvv": vvv}
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # SYNC CHECK
 # ────────────────────────────────────────────────────────────────────────────
 def file_hash(path: str = None) -> str:
@@ -857,7 +1051,16 @@ if __name__ == "__main__":
         withdrawal_eth=0.05, minipool_pending_eth=0.1, daily_accrual_eth=0.01,
         carry_min_eth_target=0.5, rpl_unstaking_amount=100.0, rpl_usd=2.0,
         eth_usd=2000.0, rpl_unstake_date=(date.today() + _td(days=5)).isoformat())
-    assert len(_cr) == 10  # ISO date string
+    assert _cr["branch"] == "dual"  # unconfirmed by default -> both dates shown
+    assert len(_cr["conservative_date"]) == 10 and len(_cr["carry_first_date"]) == 10
+    assert _cr["recheck_date"] == _cr["conservative_date"]  # conservative is the default
+    _cr_confirmed = carry_trade_recheck_date(
+        withdrawal_eth=0.05, minipool_pending_eth=0.1, daily_accrual_eth=0.01,
+        carry_min_eth_target=0.5, rpl_unstaking_amount=100.0, rpl_usd=2.0,
+        eth_usd=2000.0, rpl_unstake_date=(date.today() + _td(days=5)).isoformat(),
+        carry_first_confirmed=True)
+    assert _cr_confirmed["branch"] == "carry_first"
+    assert _cr_confirmed["recheck_date"] == _cr_confirmed["carry_first_date"]
     print("signal_core self-test OK",
           {"gto(6.8)": gto_multiplier(6.8), "split": ks,
            "e90(6.8)": expected_90d_return(6.8),
