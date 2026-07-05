@@ -13,6 +13,7 @@ from long_term_data_fetcher import LongTermDataFetcher
 from eth_fundamentals import ETHFundamentals
 import disk_cache
 import rotation_log as rlog
+from utils import format_action_label
 
 def render_crypto_app():
     """Render the main crypto analysis application"""
@@ -181,13 +182,34 @@ def render_crypto_app():
 
         st.markdown("---")
 
-        # UBI Gap — top-level objective, drives capital allocation decisions
-        from ubi_gap_content import render_ubi_gap_section
+        # Capital Router — cycle-conditional DCA vs yield split (Kelly-derived)
+        from signal_core import allocate_capital, expected_90d_return
         _avg_cycle_pct = (signals['btc_percentile'] + signals['eth_percentile']) / 2
-        render_ubi_gap_section(
-            cycle_pct=_avg_cycle_pct,
-            weekly_dca_usd=recommendation.dca_amount_usd,
+        _weekly_dca_usd = recommendation.dca_amount_usd
+
+        st.markdown("### 🚦 Capital Router")
+        router = allocate_capital(_avg_cycle_pct, _weekly_dca_usd)
+        dca_usd = router["dca"]
+        yield_usd = router["yield_usd"]
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("This week's capital", f"${_weekly_dca_usd:,.0f}")
+        r2.metric("→ DCA (cycle accumulation)", f"${dca_usd:,.0f}")
+        r3.metric("→ Yield deployment", f"${yield_usd:,.0f}")
+
+        med, iqr = expected_90d_return(_avg_cycle_pct)
+        st.caption(
+            f"At the {_avg_cycle_pct:.1f}th percentile, {router['dca_frac']*100:.0f}% of new capital "
+            f"routes to DCA and {100 - router['dca_frac']*100:.0f}% to yield. "
+            f"Empirical E[90d return] here: {med*100:+.1f}% (IQR ±{iqr*100:.1f}%). "
+            "Split is Kelly-derived from E[90d DCA] vs E[90d yield] edge over the risk-free rate "
+            "(anchors: ~89% DCA at the 7th percentile down to yield-primary at the 65th+)."
         )
+        if router.get("profit_taking_review"):
+            st.warning(
+                "⚠️ Cycle above the 50th percentile — review existing positions for "
+                "profit-taking; new capital is mostly routed to yield."
+            )
 
         st.markdown("---")
 
@@ -220,7 +242,7 @@ def render_crypto_app():
             st.markdown("### 📅 This Week's Action")
             
             # Format action text — no raw asterisks
-            action_text = recommendation.primary_action.replace('_', ' ').title().replace('Dca', 'DCA')
+            action_text = format_action_label(recommendation.primary_action)
             st.markdown(f"#### {action_text}")
             st.caption(recommendation.reasoning)
 

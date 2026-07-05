@@ -69,6 +69,28 @@ def format_currency(amount: Union[int, float], currency: str = "USD") -> str:
     else:
         return f"{format_number(amount, decimals=2)} {currency}"
 
+_PRESERVE_UPPER_TOKENS = {'usd', 'btc', 'eth', 'sol', 'dca', 'apy', 'apr', 'tvl'}
+
+
+def format_action_label(label: str) -> str:
+    """
+    Title-case a snake_case or space-separated label, keeping known
+    ticker/acronym tokens (USD, BTC, ETH, SOL, DCA, APY, APR, TVL) uppercase
+    instead of Python's .title()/.capitalize() mangling them (e.g. "Usd").
+
+    Args:
+        label (str): Raw label, e.g. "deploy_usd_aggressively"
+
+    Returns:
+        str: Formatted label, e.g. "Deploy USD Aggressively"
+    """
+    words = label.replace('_', ' ').split()
+    return ' '.join(
+        w.upper() if w.lower() in _PRESERVE_UPPER_TOKENS else w.capitalize()
+        for w in words
+    )
+
+
 def format_percentage(value: Union[int, float], decimals: int = 2) -> str:
     """
     Format percentage values

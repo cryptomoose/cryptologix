@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import json
 from exponential_cycle_engine import PortfolioState
 from persistent_storage import PersistentStorage
+from utils import format_action_label
 
 class PortfolioStateTracker:
     """
@@ -335,6 +336,6 @@ class PortfolioStateTracker:
             last_rotation = state.get('rotation_history', [])[-1] if state.get('rotation_history') else None
             if last_rotation:
                 st.info(
-                    f"**Last Rotation:** {last_rotation['type'].replace('_', ' ').title()} "
+                    f"**Last Rotation:** {format_action_label(last_rotation['type'])} "
                     f"({last_rotation['percentage']:.0f}%) on {last_rotation['date'][:10]}"
                 )
