@@ -737,6 +737,109 @@ def wealth_compounding_objective(state: dict) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# CYCLE-TOP GOAL FRAMEWORK
+#
+# Two near-term goals sit on top of the permanent HODL/compound mandate,
+# both scoped to fire only as the cycle top approaches:
+#   GOAL 1: eliminate all crypto debt (3 DeFi positions)
+#   GOAL 2: rotate crypto -> metals to lock gains
+# Sequencing: debt closure FIRST (risk elimination + smallest collateral
+# slice at collateral highs), THEN metals rotation (lock remaining gains
+# unlevered — see metals_rotation_signal's BLOCKED_BY_DEBT gate below).
+# Neither fires mid-cycle: below CYCLE_TOP_WARNING_PCT both goals are
+# dormant and the correct action is HODL + Kelly DCA.
+# ────────────────────────────────────────────────────────────────────────────
+CYCLE_TOP_WARNING_PCT = 75.0    # begin staging cycle-top actions
+CYCLE_TOP_ACTION_PCT = 85.0     # cycle-top actions become live
+CYCLE_TOP_URGENT_PCT = 92.0     # execute — top is near
+
+
+def cycle_top_readiness(state: dict) -> dict:
+    """
+    Tracks readiness for the two near-term cycle-top goals:
+      GOAL 1: eliminate all crypto debt (3 DeFi positions)
+      GOAL 2: rotate crypto -> metals to lock gains
+    Both fire near the cycle top. Sequencing: debt closure FIRST (risk
+    elimination + smallest collateral slice at collateral highs), THEN
+    metals rotation (lock remaining gains unlevered).
+    Neither fires mid-cycle — only as the top approaches.
+    """
+    cycle_pct = float(state.get('cycle_percentile', 50))
+    btc_g = float(state.get('btc_gold_percentile', 50))
+    eth_g = float(state.get('eth_gold_percentile', 50))
+    # Prefer the raw maker+aave sum (already fresh this run — see
+    # wealth_compounding_objective's identical formula) over any cached
+    # debt_unwind total, since cycle_top_readiness is computed before
+    # debt_unwind_optimizer in enrich_state (debt_unwind's third lens
+    # needs this function's phase, so it can't come first — see collector
+    # wiring notes).
+    debt = float(state.get('maker_debt_total_usd', 0) or 0) + float(state.get('aave_debt_usd', 0) or 0)
+    if not debt:
+        debt = float((state.get('debt_unwind') or {}).get('total_crypto_debt_usd', 0) or 0)
+
+    # Phase of cycle-top approach
+    if cycle_pct >= CYCLE_TOP_URGENT_PCT:
+        phase = 'TOP_URGENT'
+    elif cycle_pct >= CYCLE_TOP_ACTION_PCT:
+        phase = 'TOP_ACTION'
+    elif cycle_pct >= CYCLE_TOP_WARNING_PCT:
+        phase = 'TOP_STAGING'
+    else:
+        phase = 'ACCUMULATION'  # far from top — HODL/DCA, no top-actions
+
+    # Goal readiness
+    debt_ready = phase in ('TOP_ACTION', 'TOP_URGENT')
+    # metals rotation only after debt cleared OR at urgent phase
+    rotation_ready = (
+        phase in ('TOP_ACTION', 'TOP_URGENT')
+        and btc_g > 90 and eth_g > 90
+    )
+
+    # Sequencing directive
+    if phase == 'ACCUMULATION':
+        directive = 'HODL + DCA. No cycle-top actions. Debt is accretive leverage; metals rotation not warranted.'
+    elif phase == 'TOP_STAGING':
+        directive = (
+            f'STAGE cycle-top plan. Cycle {cycle_pct:.0f}th approaching top. '
+            f'Prepare: (1) debt closure sequence, (2) metals rotation orders. '
+            f'Do NOT execute yet — await {CYCLE_TOP_ACTION_PCT:.0f}th pct.'
+        )
+    elif phase == 'TOP_ACTION':
+        if debt > 0:
+            directive = (
+                f'EXECUTE GOAL 1 FIRST: close DeFi debt (${debt:,.0f}) while '
+                f'collateral rich. THEN Goal 2 metals rotation once unlevered.'
+            )
+        elif rotation_ready:
+            directive = 'Debt cleared. EXECUTE GOAL 2: rotate crypto -> metals to lock gains.'
+        else:
+            directive = 'Debt cleared. Metals rotation staged — await crypto-rich signal (BTC/G & ETH/G > 90th).'
+    else:  # TOP_URGENT
+        directive = (
+            f'TOP URGENT ({cycle_pct:.0f}th). Complete both goals now: '
+            f'{"close debt then " if debt > 0 else ""}rotate crypto -> metals. '
+            f'Do not wait for a higher print.'
+        )
+
+    return {
+        'cycle_pct': cycle_pct,
+        'phase': phase,
+        'goal1_debt_closure': {
+            'target': 'zero crypto debt',
+            'outstanding_usd': round(debt, 0),
+            'ready_to_execute': debt_ready and debt > 0,
+        },
+        'goal2_metals_rotation': {
+            'target': 'lock gains: crypto -> metals',
+            'btc_gold_pct': btc_g, 'eth_gold_pct': eth_g,
+            'ready_to_execute': rotation_ready,
+        },
+        'sequencing': 'debt closure BEFORE metals rotation',
+        'directive': directive,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # CAPITAL FLOW CONSTITUTION (hard constraint)
 #
 # Permitted flows ONLY:
@@ -781,17 +884,42 @@ ROTATION_CRYPTO_RICH_PCT = 90.0
 
 
 def metals_rotation_signal(state: dict) -> dict:
-    """Bidirectional rotation at market extremes (see module note above)."""
+    """Bidirectional rotation at market extremes (see module note above).
+
+    The crypto->metals leg (GOAL 2 of cycle_top_readiness) is additionally
+    gated by cycle phase and debt status: it's the second of two sequenced
+    near-term goals (debt closure first — see debt_unwind_optimizer's
+    cycle-top lens), so it should never fire ahead of debt closure, and
+    shouldn't fire as a routine mid-cycle action even if the BTC/ETH-vs-gold
+    ratio alone crosses the rich threshold. The metals->crypto leg (buying
+    the dip in crypto) has no such gate — it's a bottom signal, not a
+    near-term goal, and firing on the raw ratio is correct at any cycle
+    phase."""
     btc_g = float(state.get('btc_gold_percentile', 50))
     eth_g = float(state.get('eth_gold_percentile', 50))
 
     metals_to_crypto = btc_g < ROTATION_CRYPTO_CHEAP_PCT and eth_g < ROTATION_CRYPTO_CHEAP_PCT
     crypto_to_metals = btc_g > ROTATION_CRYPTO_RICH_PCT and eth_g > ROTATION_CRYPTO_RICH_PCT
 
+    cycle_phase = (state.get('cycle_top_readiness') or {}).get('phase', 'ACCUMULATION')
+    debt = float(state.get('maker_debt_total_usd', 0) or 0) + float(state.get('aave_debt_usd', 0) or 0)
+    if not debt:
+        debt = float((state.get('debt_unwind') or {}).get('total_crypto_debt_usd', 0) or 0)
+
     if metals_to_crypto:
         direction, action = 'METALS_TO_CRYPTO', 'Sell physical metals -> buy BTC/ETH spot (Kelly split)'
     elif crypto_to_metals:
-        direction, action = 'CRYPTO_TO_METALS', 'Rotate BTC/ETH -> physical metals (lock gains as metals, never USD)'
+        if cycle_phase not in ('TOP_ACTION', 'TOP_URGENT'):
+            direction, action = 'NONE', (
+                f'Crypto/gold ratio rich but cycle phase {cycle_phase} — GOAL 2 rotation dormant '
+                f'below the {CYCLE_TOP_ACTION_PCT:.0f}th pct staging threshold, not a routine mid-cycle action.'
+            )
+        elif debt > 0:
+            direction, action = 'CRYPTO_TO_METALS_BLOCKED_BY_DEBT', (
+                'Close DeFi debt first, then rotate. Sequencing: debt before metals.'
+            )
+        else:
+            direction, action = 'CRYPTO_TO_METALS', 'Rotate BTC/ETH -> physical metals (lock gains as metals, never USD)'
     else:
         direction, action = 'NONE', 'No rotation — ratios between extremes'
 
@@ -839,10 +967,21 @@ def debt_unwind_optimizer(state: dict) -> dict:
       is at a local high in the collateral ratio — tracked run over run
       via each position's previous cost-to-close.
 
-    Liquidation danger (buffer_pct < 15%) overrides both lenses: force close.
+    LENS 3 — Cycle-top goal (signal_core.cycle_top_readiness)
+      Near the cycle top, GOAL 1 is to close all debt even if leverage is
+      still marginally accretive on Lens 1 — locking in the cycle at
+      collateral highs is the mandate, not maximizing EV on the leverage.
+      Fires only once cycle_top_readiness's phase reaches TOP_ACTION or
+      TOP_URGENT, and only after the force-close and economic checks have
+      already had their say (a distressed or genuinely uneconomic position
+      is still reported as such, not relabeled as a deliberate cycle-top
+      close).
+
+    Priority: force-close > economic close > cycle-top close > HOLD.
     """
     exp_90d = float(state.get('expected_90d_return', 0.10))  # from empirical_90d_return
     annualized_appreciation = exp_90d * 4  # 90d -> annual proxy
+    cycle_phase = (state.get('cycle_top_readiness') or {}).get('phase', 'ACCUMULATION')
     positions = []
 
     def analyze(name, state_key, collateral_usd, debt_usd, collateral_ratio,
@@ -872,6 +1011,12 @@ def debt_unwind_optimizer(state: dict) -> dict:
                 f'CLOSE — leverage no longer accretive: economic edge {economic_edge*100:+.1f}% '
                 f'(collateral yield {collateral_staking_yield*100:.1f}% + appreciation '
                 f'{annualized_appreciation*100:.1f}% < borrow {borrow_apr*100:.1f}%)'
+            )
+        elif cycle_phase in ('TOP_ACTION', 'TOP_URGENT'):
+            status, action = 'CLOSE_CYCLE_TOP', (
+                f'CLOSE — cycle-top goal: collateral rich ({collateral_ratio:.0f}%), '
+                f'cost-to-close at cycle-low {crypto_units_to_close:.3f} ETH-equiv. '
+                f'Eliminate debt before rotation per near-term mandate.'
             )
         else:
             status, action = 'HOLD', (
@@ -926,9 +1071,10 @@ def debt_unwind_optimizer(state: dict) -> dict:
         eth_usd,
     ))
 
-    any_close = any(p.get('status') in ('CLOSE_ECONOMIC', 'FORCE_CLOSE') for p in positions)
+    any_close = any(p.get('status') in ('CLOSE_ECONOMIC', 'FORCE_CLOSE', 'CLOSE_CYCLE_TOP') for p in positions)
     any_economic_close = any(p.get('status') == 'CLOSE_ECONOMIC' for p in positions)
     any_force_close = any(p.get('status') == 'FORCE_CLOSE' for p in positions)
+    any_cycle_top_close = any(p.get('status') == 'CLOSE_CYCLE_TOP' for p in positions)
     total_debt = sum(p.get('debt_usd', 0) for p in positions if isinstance(p.get('debt_usd'), (int, float)))
     buffers = [p['buffer_pct'] for p in positions if 'buffer_pct' in p]
     min_buffer_pct = round(min(buffers), 1) if buffers else None
@@ -939,9 +1085,10 @@ def debt_unwind_optimizer(state: dict) -> dict:
         'any_close_signal': any_close,
         'any_economic_close_signal': any_economic_close,
         'any_force_close_signal': any_force_close,
+        'any_cycle_top_close_signal': any_cycle_top_close,
         'min_buffer_pct': min_buffer_pct,
         'target': 'zero crypto debt',
-        'method': 'two-lens: economic edge (accretive leverage, EV) + cost-to-close local minimum (risk reduction, independent of EV)',
+        'method': 'three-lens: economic edge (accretive leverage, EV) + cost-to-close local minimum (risk reduction) + cycle-top goal (close before rotation near the top)',
         'strategy_note': (
             'Buy/borrow/die: debt is free leverage while collateral yield + '
             'appreciation > borrow rate. Economic closure only when edge turns '
@@ -1256,9 +1403,11 @@ if __name__ == "__main__":
     assert m > 0.4, m
     ks = kelly_split({"BTC": 9.7, "ETH": 3.8})
     assert abs(sum(v for k, v in ks.items() if k != "_diag") - 1.0) < 1e-6
-    alloc = allocate_capital(6.8, 1000, [{"name": "sUSDai", "apy": 7.8}])
+    # audit_factor/tvl_m must clear PRIMARY_MIN_TVL_M/PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR
+    # or the gate routes 100% to DCA regardless of cycle pct (see allocate_capital).
+    alloc = allocate_capital(6.8, 1000, [{"name": "sUSDai", "apy": 7.8, "tvl_m": 200, "audit_factor": 0.9}])
     assert 850 < alloc["dca"] < 900, alloc  # Kelly at ~7th pct: ~88.6% DCA, not 100%
-    alloc2 = allocate_capital(25, 1000, [{"name": "sUSDai", "apy": 7.8}])
+    alloc2 = allocate_capital(25, 1000, [{"name": "sUSDai", "apy": 7.8, "tvl_m": 200, "audit_factor": 0.9}])
     assert 0 < alloc2["yield_usd"] < 1000
     # Synthetic test figures only — not real portfolio data (this file is
     # mirrored to a public repo).
