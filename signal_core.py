@@ -393,24 +393,24 @@ def top_rotation_pct(avg_pct: float) -> float:
 # score = APY * ln(TVL_millions)**1.5 * audit_factor — TVL exponent raised
 # from 1.0 to 1.5 because the plain-log version was APY-dominated: it let
 # small unaudited pools outscore large audited ones by 3-4x on APY alone.
-# Two gates sit in front of the score:
-#   1. TVL floor — below it, WATCH LIST only, never primary allocation.
-#   2. Audit floor for primary allocation above $500 — even a good score
-#      can't carry an unaudited protocol into a >$500 primary slot.
+# One hard gate sits in front of the score: TVL >= $75M AND audit >= 0.8,
+# applied regardless of allocation size. A tiered exception used to let
+# allocations <= $500 clear on a $25M TVL floor with no audit requirement —
+# that's what let sub-$75M/sub-audit pools (e.g. stake-dao SDCRV, ~$26M TVL)
+# win small router slots three times over. There is no dollar amount below
+# which routing to a gate-failed protocol becomes acceptable, so the gate
+# no longer varies with allocation_usd.
 # ────────────────────────────────────────────────────────────────────────────
-PRIMARY_TVL_FLOOR_USD = 500.0
-PRIMARY_MIN_TVL_M = 75.0     # TVL floor (millions) for allocations > $500
-SECONDARY_MIN_TVL_M = 25.0   # TVL floor (millions) for allocations <= $500
+PRIMARY_MIN_TVL_M = 75.0     # TVL floor (millions) — applies to every allocation size
 PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR = 0.8
 
 
 def score_yield_opportunity(apy_pct: float, tvl_millions: float,
                             audit_factor: float) -> float:
     """Risk-adjusted score: APY * ln(TVL_millions)**1.5 * audit_factor.
-    Callers should gate on TVL floors (PRIMARY_MIN_TVL_M / SECONDARY_MIN_TVL_M)
-    and PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR before treating a high score as a
-    primary-allocation recommendation — the score alone doesn't encode those
-    hard gates."""
+    Callers should gate on PRIMARY_MIN_TVL_M and PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR
+    before treating a high score as a primary-allocation recommendation — the
+    score alone doesn't encode those hard gates."""
     if tvl_millions is None or tvl_millions <= 1:
         return 0.0
     return round(float(apy_pct) * (math.log(float(tvl_millions)) ** 1.5) * float(audit_factor), 2)
@@ -418,12 +418,12 @@ def score_yield_opportunity(apy_pct: float, tvl_millions: float,
 
 def eligible_for_primary(allocation_usd: float, tvl_millions: float,
                          audit_factor: float) -> bool:
-    """Gate 1 (TVL floor, tiered by allocation size) + Gate 2 (audit floor
-    above the $500 primary-allocation threshold)."""
-    floor = PRIMARY_MIN_TVL_M if allocation_usd > PRIMARY_TVL_FLOOR_USD else SECONDARY_MIN_TVL_M
-    if (tvl_millions or 0) < floor:
+    """Hard gate: TVL >= $75M AND audit >= 0.8, regardless of allocation size.
+    allocation_usd is accepted for call-site compatibility but no longer
+    changes the floor — see module note above."""
+    if (tvl_millions or 0) < PRIMARY_MIN_TVL_M:
         return False
-    if allocation_usd > PRIMARY_TVL_FLOOR_USD and audit_factor < PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR:
+    if (audit_factor or 0) < PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR:
         return False
     return True
 
@@ -524,16 +524,28 @@ def allocate_capital(cycle_pct: float, available_capital: float,
                 filtered_protocols.append({"opportunity": o.get("name") or o.get("pool", "?"),
                                            "apy": o.get("apy"), "audit_factor": audit_factor,
                                            "tvl_m": tvl_m, "reason": "below audit/TVL floor"})
-        top = sorted(eligible, key=lambda o: -(o.get("apy") or 0))[:3]
-        shares = [0.5, 0.3, 0.2][:len(top)]
-        norm = sum(shares) if top else 1
-        for o, s in zip(top, shares):
-            slots.append({"opportunity": o.get("name") or o.get("pool", "?"),
-                          "apy": o.get("apy"),
-                          "amount": round(yield_usd * s / norm, 2)})
+        if not eligible:
+            # No gate-cleared protocol this week — never route to a sub-gate
+            # protocol. Redirect the yield-earmarked capital to DCA instead
+            # of leaving it stranded in yield_usd with no slot to land in.
+            dca_usd = cap
+            yield_usd = 0.0
+        else:
+            top = sorted(eligible, key=lambda o: -(o.get("apy") or 0))[:3]
+            shares = [0.5, 0.3, 0.2][:len(top)]
+            norm = sum(shares) if top else 1
+            for o, s in zip(top, shares):
+                slots.append({"opportunity": o.get("name") or o.get("pool", "?"),
+                              "apy": o.get("apy"),
+                              "amount": round(yield_usd * s / norm, 2)})
+    no_gate_cleared_note = (
+        "no gate-cleared protocol (all candidates below $75M TVL or audit <0.8 this week)"
+        if yield_usd == 0 and filtered_protocols and not slots else None
+    )
     return {"dca": dca_usd, "yield_usd": yield_usd, "yield_slots": slots,
             "filtered_protocols": filtered_protocols,
-            "dca_frac": round(dca_frac, 4),
+            "no_gate_cleared_note": no_gate_cleared_note,
+            "dca_frac": round(dca_usd / cap, 4) if cap else round(dca_frac, 4),
             "profit_taking_review": p >= 50.0}
 
 
@@ -700,8 +712,13 @@ def wealth_compounding_objective(state: dict) -> dict:
     # Compounding efficiency: NAV per dollar contributed
     efficiency = (portfolio / cost_basis_total) if cost_basis_total > 0 else None
 
-    # Debt unwind progress
+    # Debt unwind progress. Until closures actually start, debt sits at (or
+    # near) its peak — a literal "0.0% unwound" reads as if no progress is
+    # possible, when really it just means the closure signal hasn't fired
+    # yet. at_or_near_peak distinguishes "haven't started" from "made no
+    # progress despite trying."
     debt_unwind_pct = ((debt_at_peak - crypto_debt) / debt_at_peak * 100) if debt_at_peak > 0 else 0
+    debt_at_or_near_peak = debt_unwind_pct < 1.0
 
     return {
         'nav_usd': round(portfolio, 0),
@@ -712,7 +729,9 @@ def wealth_compounding_objective(state: dict) -> dict:
             f"({efficiency:.2f}x)" if efficiency else "cost basis unavailable"
         ),
         'crypto_debt_outstanding_usd': round(crypto_debt, 0),
+        'crypto_debt_peak_usd': round(debt_at_peak, 0),
         'crypto_debt_unwind_pct': round(debt_unwind_pct, 1),
+        'debt_at_or_near_peak': debt_at_or_near_peak,
         'objective': 'Compound NAV via Kelly DCA | preserve via metals rotation at extremes | zero crypto debt',
     }
 
@@ -801,76 +820,86 @@ def metals_rotation_signal(state: dict) -> dict:
 # ────────────────────────────────────────────────────────────────────────────
 def debt_unwind_optimizer(state: dict) -> dict:
     """
-    Per-position unwind analysis. Closing a debt position requires selling
-    a slice of collateral to repay USD-denominated debt (the scoped
-    crypto->USD exception). GTO trigger:
+    Per-position unwind analysis under a buy/borrow/die thesis: debt is
+    free leverage as long as it's economically accretive, and the separate
+    goal of eliminating it entirely (the preservation mandate) is a risk
+    decision, not an EV decision. Two independent lenses:
 
-      Close when: annual_carry_cost + liquidation_risk_premium
-                  > expected_appreciation_on_repayment_slice
+    LENS 1 — Economic (is the leverage still free money?)
+      economic_edge = (collateral_staking_yield + annualized_appreciation)
+                       - borrow_apr
+      edge > 0: leverage is accretive, HOLD is EV-correct.
+      edge < 0: leverage is costing you net of yield/appreciation, close
+      for EV regardless of collateral ratio.
 
-    where repayment_slice = debt / collateral_price (crypto units needed
-    to clear debt). The higher the collateral has appreciated, the smaller
-    that slice — so cost-to-close in crypto terms is minimized at collateral
-    highs. But forfeited appreciation on that slice rises with cycle
-    percentile. Net trigger balances both.
+    LENS 2 — Risk (cost to close, independent of EV)
+      crypto_units_to_close = debt_usd / current_price — the collateral
+      slice surrendered to clear the debt. This shrinks as collateral
+      appreciates, so the cheapest (in crypto terms) risk-reduction exit
+      is at a local high in the collateral ratio — tracked run over run
+      via each position's previous cost-to-close.
+
+    Liquidation danger (buffer_pct < 15%) overrides both lenses: force close.
     """
-    eth_usd = float(state.get('eth_usd', 1794))
-    cycle_pct = float(state.get('cycle_percentile', 50))
     exp_90d = float(state.get('expected_90d_return', 0.10))  # from empirical_90d_return
+    annualized_appreciation = exp_90d * 4  # 90d -> annual proxy
     positions = []
 
-    def analyze(name, collateral_usd, debt_usd, collateral_ratio,
-                borrow_apr, liq_price, current_price):
+    def analyze(name, state_key, collateral_usd, debt_usd, collateral_ratio,
+                borrow_apr, liq_price, current_price, collateral_staking_yield=0.037):
         if debt_usd <= 0:
             return {'name': name, 'status': 'NO_DEBT', 'action': 'none'}
 
-        # Crypto units surrendered to repay debt
-        repay_slice_usd = debt_usd
-        # Annual carry cost of keeping the debt open
-        annual_carry = debt_usd * borrow_apr
-        # Liquidation risk premium: distance to liq as risk proxy
+        # LENS 1 — economic edge: is the leverage still free money?
+        economic_edge = (collateral_staking_yield + annualized_appreciation) - borrow_apr
+        leverage_accretive = economic_edge > 0
+
+        # LENS 2 — risk / cost-to-close, independent of EV
+        crypto_units_to_close = debt_usd / current_price if current_price else 0
         buffer_pct = (current_price - liq_price) / current_price if current_price else 1
-        liq_risk_premium = debt_usd * max(0, (0.30 - buffer_pct)) * 0.5  # rises as buffer <30%
-        # Expected appreciation forfeited on the repayment slice over 90d, annualized
-        forfeited_appreciation = repay_slice_usd * exp_90d * 4  # 90d -> annual proxy
+        prev_units_key = f'{state_key}_prev_close_units'
+        prev_units = state.get(prev_units_key)
+        at_local_min = prev_units is not None and crypto_units_to_close < prev_units
+        state[prev_units_key] = crypto_units_to_close
 
-        # GTO net: positive => close now
-        net_close_benefit = (annual_carry + liq_risk_premium) - forfeited_appreciation
-
-        # Collateral appreciation cushion: how much collateral exceeds debt
-        cushion_ratio = collateral_usd / debt_usd if debt_usd else 0
-
-        should_close = net_close_benefit > 0
-        # Even if not net-positive, force-close consideration if buffer dangerous
+        annual_carry = debt_usd * borrow_apr
         force_close = buffer_pct < 0.15
+
+        if force_close:
+            status, action = 'FORCE_CLOSE', f'FORCE CLOSE — buffer {buffer_pct*100:.0f}% dangerously low'
+        elif not leverage_accretive:
+            status, action = 'CLOSE_ECONOMIC', (
+                f'CLOSE — leverage no longer accretive: economic edge {economic_edge*100:+.1f}% '
+                f'(collateral yield {collateral_staking_yield*100:.1f}% + appreciation '
+                f'{annualized_appreciation*100:.1f}% < borrow {borrow_apr*100:.1f}%)'
+            )
+        else:
+            status, action = 'HOLD', (
+                f'HOLD — leverage accretive (edge {economic_edge*100:+.1f}%). '
+                f'Cost to close now: {crypto_units_to_close:.3f} ETH-equiv. '
+                + ('At local cost-min — opportunistic close window if reducing risk.'
+                   if at_local_min else
+                   'Await lower cost-to-close (higher collateral ratio) for risk-reduction exit.')
+            )
 
         return {
             'name': name,
             'debt_usd': round(debt_usd, 0),
             'collateral_usd': round(collateral_usd, 0),
             'collateral_ratio_pct': round(collateral_ratio, 1),
-            'cushion_ratio': round(cushion_ratio, 2),
-            'repay_slice_usd': round(repay_slice_usd, 0),
+            'economic_edge_pct': round(economic_edge * 100, 2),
+            'leverage_accretive': leverage_accretive,
+            'crypto_units_to_close': round(crypto_units_to_close, 3),
+            'at_local_cost_min': at_local_min,
             'annual_carry_cost': round(annual_carry, 0),
-            'liq_risk_premium': round(liq_risk_premium, 0),
-            'forfeited_appreciation_annual': round(forfeited_appreciation, 0),
-            'net_close_benefit': round(net_close_benefit, 0),
             'buffer_pct': round(buffer_pct * 100, 1),
-            'should_close': should_close,
-            'force_close': force_close,
-            'action': (
-                f'CLOSE NOW — carry+risk (${annual_carry + liq_risk_premium:,.0f}) '
-                f'> forfeited appreciation (${forfeited_appreciation:,.0f})'
-                if should_close else
-                f'FORCE CLOSE — buffer {buffer_pct*100:.0f}% dangerously low'
-                if force_close else
-                f'HOLD — appreciation (${forfeited_appreciation:,.0f}) still exceeds '
-                f'carry+risk (${annual_carry + liq_risk_premium:,.0f}); revisit at higher collateral ratio'
-            ),
+            'status': status,
+            'action': action,
         }
 
+    eth_usd = float(state.get('eth_usd', 1794))
     positions.append(analyze(
-        'Maker Vault 30698',
+        'Maker Vault 30698', 'vault_30698',
         float(state.get('vault_30698_collateral_usd', 0) or 0),
         float(state.get('vault_30698_debt_usd', 0) or 0),
         float(state.get('vault_30698_ratio', 0) or 0),
@@ -879,7 +908,7 @@ def debt_unwind_optimizer(state: dict) -> dict:
         eth_usd,
     ))
     positions.append(analyze(
-        'Maker Vault 31944',
+        'Maker Vault 31944', 'vault_31944',
         float(state.get('vault_31944_collateral_usd', 0) or 0),
         float(state.get('vault_31944_debt_usd', 0) or 0),
         float(state.get('vault_31944_ratio', 0) or 0),
@@ -888,7 +917,7 @@ def debt_unwind_optimizer(state: dict) -> dict:
         eth_usd,
     ))
     positions.append(analyze(
-        'Aave V3 Arbitrum',
+        'Aave V3 Arbitrum', 'aave',
         float(state.get('aave_collateral_usd', 0) or 0),
         float(state.get('aave_debt_usd', 0) or 0),
         float(state.get('aave_hf', 0) or 0) * 100,  # HF as ratio proxy
@@ -897,15 +926,28 @@ def debt_unwind_optimizer(state: dict) -> dict:
         eth_usd,
     ))
 
-    any_close = any(p.get('should_close') or p.get('force_close') for p in positions)
+    any_close = any(p.get('status') in ('CLOSE_ECONOMIC', 'FORCE_CLOSE') for p in positions)
+    any_economic_close = any(p.get('status') == 'CLOSE_ECONOMIC' for p in positions)
+    any_force_close = any(p.get('status') == 'FORCE_CLOSE' for p in positions)
     total_debt = sum(p.get('debt_usd', 0) for p in positions if isinstance(p.get('debt_usd'), (int, float)))
+    buffers = [p['buffer_pct'] for p in positions if 'buffer_pct' in p]
+    min_buffer_pct = round(min(buffers), 1) if buffers else None
 
     return {
         'positions': positions,
         'total_crypto_debt_usd': round(total_debt, 0),
         'any_close_signal': any_close,
+        'any_economic_close_signal': any_economic_close,
+        'any_force_close_signal': any_force_close,
+        'min_buffer_pct': min_buffer_pct,
         'target': 'zero crypto debt',
-        'method': 'close each independently at GTO optimal — collateral slice repays debt (scoped crypto->USD exception)',
+        'method': 'two-lens: economic edge (accretive leverage, EV) + cost-to-close local minimum (risk reduction, independent of EV)',
+        'strategy_note': (
+            'Buy/borrow/die: debt is free leverage while collateral yield + '
+            'appreciation > borrow rate. Economic closure only when edge turns '
+            'negative. Risk-reduction closure is opportunistic at collateral highs '
+            '(cost-to-close local minimum). Force-close only on liquidation danger.'
+        ),
     }
 
 
