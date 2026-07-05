@@ -70,8 +70,6 @@ EMPIRICAL_90D_RETURNS = {
 # Callers should pass live-computed vols when available; these are fallbacks.
 DEFAULT_VOL_ANN = {"BTC": 0.4665, "ETH": 0.7100, "SOL": 0.7990}
 
-UBI_TARGET_MONTHLY = 1500.0
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # CYCLE PERCENTILE
@@ -679,63 +677,236 @@ def perps_gate_status(withdrawal_eth: float, cycle_pct: float,
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# UBI GAP TRACKER
+# WEALTH COMPOUNDING OBJECTIVE (top-level objective)
 #
-# months_to_close_base_case previously annualized the empirical 90d median
-# return — (1+med90)**(365/90)-1 — as a proxy for long-run price growth.
-# That's invalid: cycle percentile rises as price rises, so the 90d forward
-# return shrinks as the portfolio grows: compounding a single 90d-horizon
-# figure at that power systematically overstates long-run appreciation.
-# The base case instead uses a fixed, conservative full-cycle appreciation
-# rate for a BTC/ETH/SOL portfolio, independent of the current percentile.
+# Replaces the prior UBI-income-target framing. There is no monthly USD
+# income target anywhere in this engine — the objective is pure NAV
+# compounding: grow via Kelly-optimal DCA, preserve via crypto<->metals
+# rotation at cycle extremes, and eliminate crypto debt via the GTO
+# debt-unwind optimizer below.
 # ────────────────────────────────────────────────────────────────────────────
-BASE_CASE_ANNUAL_APPRECIATION = 0.15  # conservative full-cycle BTC/ETH/SOL assumption
+def wealth_compounding_objective(state: dict) -> dict:
+    """
+    Top-level objective: grow NAV via Kelly-optimal DCA, preserve via
+    crypto<->metals rotation at extremes, eliminate crypto debt.
+    Never denominated in a USD income target — pure capital compounding.
+    """
+    portfolio = float(state.get('portfolio_usd', 0))
+    cost_basis_total = float(state.get('total_contributions_usd', 0) or 0)
+    crypto_debt = (float(state.get('maker_debt_total_usd', 0) or 0) +
+                   float(state.get('aave_debt_usd', 0) or 0))
+    debt_at_peak = float(state.get('crypto_debt_peak_usd', crypto_debt) or crypto_debt)
+
+    # Compounding efficiency: NAV per dollar contributed
+    efficiency = (portfolio / cost_basis_total) if cost_basis_total > 0 else None
+
+    # Debt unwind progress
+    debt_unwind_pct = ((debt_at_peak - crypto_debt) / debt_at_peak * 100) if debt_at_peak > 0 else 0
+
+    return {
+        'nav_usd': round(portfolio, 0),
+        'total_contributions_usd': round(cost_basis_total, 0),
+        'compounding_efficiency': round(efficiency, 3) if efficiency else None,
+        'compounding_note': (
+            f"${portfolio:,.0f} NAV from ${cost_basis_total:,.0f} contributed "
+            f"({efficiency:.2f}x)" if efficiency else "cost basis unavailable"
+        ),
+        'crypto_debt_outstanding_usd': round(crypto_debt, 0),
+        'crypto_debt_unwind_pct': round(debt_unwind_pct, 1),
+        'objective': 'Compound NAV via Kelly DCA | preserve via metals rotation at extremes | zero crypto debt',
+    }
 
 
-def ubi_gap_report(yield_sources: dict, target_monthly: float = UBI_TARGET_MONTHLY,
-                   portfolio_usd: float = None, cycle_pct: float = None) -> dict:
-    """UBI gap = target monthly income minus current distributable yield.
+# ────────────────────────────────────────────────────────────────────────────
+# CAPITAL FLOW CONSTITUTION (hard constraint)
+#
+# Permitted flows ONLY:
+#   USD    -> crypto   (DCA entry)
+#   crypto -> metals   (rotation at crypto-rich extreme)
+#   metals -> USD      (rotation at metals-rich extreme, re-enters as crypto)
+#   crypto -> USD      (ONLY for DeFi debt closure — see debt_unwind_optimizer)
+# FORBIDDEN:
+#   crypto -> USD for profit-taking / de-risking / any non-debt purpose
+# ────────────────────────────────────────────────────────────────────────────
+CAPITAL_FLOW_RULE = {
+    'usd_to_crypto': True,
+    'crypto_to_metals': True,
+    'metals_to_usd': True,
+    'crypto_to_usd_profit': False,   # NEVER
+    'crypto_to_usd_debt_closure': True,  # scoped exception only
+}
 
-    yield_sources: {"name": annual_usd, ...} (annual USD per source).
-    Returns gap, coverage %, and — when portfolio_usd is given — a base-case
-    months-to-close estimate assuming the portfolio grows at a fixed
-    BASE_CASE_ANNUAL_APPRECIATION rate (not an annualized 90d figure — see
-    module note above) while the blended yield rate on NAV holds constant."""
-    annual = {k: float(v or 0) for k, v in (yield_sources or {}).items()}
-    total_annual = sum(annual.values())
-    monthly = total_annual / 12.0
-    gap = max(0.0, target_monthly - monthly)
-    out = {"target_monthly": round(target_monthly, 2),
-           "current_monthly": round(monthly, 2),
-           "gap_monthly": round(gap, 2),
-           "coverage_pct": round(monthly / target_monthly * 100, 1) if target_monthly else 0.0,
-           "sources_annual": {k: round(v, 2) for k, v in annual.items()},
-           "months_to_close_base_case": None,
-           "base_case_monthly_yield_now": round(monthly, 2)}
-    if portfolio_usd and portfolio_usd > 0 and total_annual > 0:
-        yield_rate = total_annual / portfolio_usd  # blended realized yield on NAV
-        growth_ann = BASE_CASE_ANNUAL_APPRECIATION
-        portfolio_90d = portfolio_usd * (1 + growth_ann) ** (90.0 / 365.0)
-        portfolio_12mo = portfolio_usd * (1 + growth_ann)
-        out["base_case_monthly_yield_90d"] = round(portfolio_90d * yield_rate / 12.0, 2)
-        out["base_case_monthly_yield_12mo"] = round(portfolio_12mo * yield_rate / 12.0, 2)
-        out["portfolio_required_at_current_yield_rate"] = round(target_monthly * 12.0 / yield_rate, 2)
-        if gap > 0:
-            needed_nav = target_monthly * 12.0 / yield_rate
-            g_m = (1 + growth_ann) ** (1 / 12.0) - 1
-            if needed_nav <= portfolio_usd:
-                out["months_to_close_base_case"] = 0
-            elif g_m > 0:
-                months = math.log(needed_nav / portfolio_usd) / math.log(1 + g_m)
-                out["months_to_close_base_case"] = round(months, 1)
-        else:
-            out["months_to_close_base_case"] = 0
-        out["base_case_assumptions"] = {
-            "blended_yield_rate_pct": round(yield_rate * 100, 2),
-            "price_growth_ann_pct": round(growth_ann * 100, 1),
-            "note": "fixed base-case appreciation rate, NOT an annualized "
-                    "90d empirical return; yield rate held constant on NAV"}
-    return out
+
+def validate_action_flow(action_type: str) -> tuple:
+    """Guard: reject any recommendation that would sell crypto to USD
+    outside debt closure. Called before any sell/rotate action is emitted."""
+    forbidden = {
+        'sell_crypto_usd', 'take_profit_usd', 'derisk_to_stable',
+        'crypto_to_cash', 'trim_to_usd'
+    }
+    if action_type in forbidden:
+        return False, ("BLOCKED by capital flow rule: crypto never converts "
+                       "to USD except DeFi debt closure. Route via metals instead.")
+    return True, "permitted"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# BIDIRECTIONAL METALS ROTATION
+#
+# crypto CHEAP vs metals (both ratios < 5th pct)  -> rotate metals INTO crypto
+# crypto RICH  vs metals (both ratios > 90th pct) -> rotate crypto INTO metals
+# Both legs require BOTH BTC/Gold AND ETH/Gold to confirm.
+# ────────────────────────────────────────────────────────────────────────────
+ROTATION_CRYPTO_CHEAP_PCT = 5.0
+ROTATION_CRYPTO_RICH_PCT = 90.0
+
+
+def metals_rotation_signal(state: dict) -> dict:
+    """Bidirectional rotation at market extremes (see module note above)."""
+    btc_g = float(state.get('btc_gold_percentile', 50))
+    eth_g = float(state.get('eth_gold_percentile', 50))
+
+    metals_to_crypto = btc_g < ROTATION_CRYPTO_CHEAP_PCT and eth_g < ROTATION_CRYPTO_CHEAP_PCT
+    crypto_to_metals = btc_g > ROTATION_CRYPTO_RICH_PCT and eth_g > ROTATION_CRYPTO_RICH_PCT
+
+    if metals_to_crypto:
+        direction, action = 'METALS_TO_CRYPTO', 'Sell physical metals -> buy BTC/ETH spot (Kelly split)'
+    elif crypto_to_metals:
+        direction, action = 'CRYPTO_TO_METALS', 'Rotate BTC/ETH -> physical metals (lock gains as metals, never USD)'
+    else:
+        direction, action = 'NONE', 'No rotation — ratios between extremes'
+
+    dist_cheap = max(btc_g - ROTATION_CRYPTO_CHEAP_PCT, eth_g - ROTATION_CRYPTO_CHEAP_PCT)
+    dist_rich = max(ROTATION_CRYPTO_RICH_PCT - btc_g, ROTATION_CRYPTO_RICH_PCT - eth_g)
+
+    return {
+        'direction': direction,
+        'action': action,
+        'btc_gold_pct': btc_g,
+        'eth_gold_pct': eth_g,
+        'dist_to_cheap_trigger_pp': round(dist_cheap, 1),
+        'dist_to_rich_trigger_pp': round(dist_rich, 1),
+        'cheap_trigger': ROTATION_CRYPTO_CHEAP_PCT,
+        'rich_trigger': ROTATION_CRYPTO_RICH_PCT,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# DEFI DEBT-UNWIND OPTIMIZER
+#
+# Goal: eliminate all crypto debt (Maker vaults 30698, 31944 + Aave), closing
+# each independently at its GTO-optimal point. GTO = close when the interest
+# + liquidation risk saved exceeds expected appreciation forfeited on the
+# collateral surrendered to repay.
+# ────────────────────────────────────────────────────────────────────────────
+def debt_unwind_optimizer(state: dict) -> dict:
+    """
+    Per-position unwind analysis. Closing a debt position requires selling
+    a slice of collateral to repay USD-denominated debt (the scoped
+    crypto->USD exception). GTO trigger:
+
+      Close when: annual_carry_cost + liquidation_risk_premium
+                  > expected_appreciation_on_repayment_slice
+
+    where repayment_slice = debt / collateral_price (crypto units needed
+    to clear debt). The higher the collateral has appreciated, the smaller
+    that slice — so cost-to-close in crypto terms is minimized at collateral
+    highs. But forfeited appreciation on that slice rises with cycle
+    percentile. Net trigger balances both.
+    """
+    eth_usd = float(state.get('eth_usd', 1794))
+    cycle_pct = float(state.get('cycle_percentile', 50))
+    exp_90d = float(state.get('expected_90d_return', 0.10))  # from empirical_90d_return
+    positions = []
+
+    def analyze(name, collateral_usd, debt_usd, collateral_ratio,
+                borrow_apr, liq_price, current_price):
+        if debt_usd <= 0:
+            return {'name': name, 'status': 'NO_DEBT', 'action': 'none'}
+
+        # Crypto units surrendered to repay debt
+        repay_slice_usd = debt_usd
+        # Annual carry cost of keeping the debt open
+        annual_carry = debt_usd * borrow_apr
+        # Liquidation risk premium: distance to liq as risk proxy
+        buffer_pct = (current_price - liq_price) / current_price if current_price else 1
+        liq_risk_premium = debt_usd * max(0, (0.30 - buffer_pct)) * 0.5  # rises as buffer <30%
+        # Expected appreciation forfeited on the repayment slice over 90d, annualized
+        forfeited_appreciation = repay_slice_usd * exp_90d * 4  # 90d -> annual proxy
+
+        # GTO net: positive => close now
+        net_close_benefit = (annual_carry + liq_risk_premium) - forfeited_appreciation
+
+        # Collateral appreciation cushion: how much collateral exceeds debt
+        cushion_ratio = collateral_usd / debt_usd if debt_usd else 0
+
+        should_close = net_close_benefit > 0
+        # Even if not net-positive, force-close consideration if buffer dangerous
+        force_close = buffer_pct < 0.15
+
+        return {
+            'name': name,
+            'debt_usd': round(debt_usd, 0),
+            'collateral_usd': round(collateral_usd, 0),
+            'collateral_ratio_pct': round(collateral_ratio, 1),
+            'cushion_ratio': round(cushion_ratio, 2),
+            'repay_slice_usd': round(repay_slice_usd, 0),
+            'annual_carry_cost': round(annual_carry, 0),
+            'liq_risk_premium': round(liq_risk_premium, 0),
+            'forfeited_appreciation_annual': round(forfeited_appreciation, 0),
+            'net_close_benefit': round(net_close_benefit, 0),
+            'buffer_pct': round(buffer_pct * 100, 1),
+            'should_close': should_close,
+            'force_close': force_close,
+            'action': (
+                f'CLOSE NOW — carry+risk (${annual_carry + liq_risk_premium:,.0f}) '
+                f'> forfeited appreciation (${forfeited_appreciation:,.0f})'
+                if should_close else
+                f'FORCE CLOSE — buffer {buffer_pct*100:.0f}% dangerously low'
+                if force_close else
+                f'HOLD — appreciation (${forfeited_appreciation:,.0f}) still exceeds '
+                f'carry+risk (${annual_carry + liq_risk_premium:,.0f}); revisit at higher collateral ratio'
+            ),
+        }
+
+    positions.append(analyze(
+        'Maker Vault 30698',
+        float(state.get('vault_30698_collateral_usd', 0) or 0),
+        float(state.get('vault_30698_debt_usd', 0) or 0),
+        float(state.get('vault_30698_ratio', 0) or 0),
+        float(state.get('maker_stability_fee', 0.055) or 0.055),
+        float(state.get('vault_30698_liq_price', 0) or 0),
+        eth_usd,
+    ))
+    positions.append(analyze(
+        'Maker Vault 31944',
+        float(state.get('vault_31944_collateral_usd', 0) or 0),
+        float(state.get('vault_31944_debt_usd', 0) or 0),
+        float(state.get('vault_31944_ratio', 0) or 0),
+        float(state.get('maker_stability_fee', 0.055) or 0.055),
+        float(state.get('vault_31944_liq_price', 0) or 0),
+        eth_usd,
+    ))
+    positions.append(analyze(
+        'Aave V3 Arbitrum',
+        float(state.get('aave_collateral_usd', 0) or 0),
+        float(state.get('aave_debt_usd', 0) or 0),
+        float(state.get('aave_hf', 0) or 0) * 100,  # HF as ratio proxy
+        float(state.get('aave_borrow_apr', 0.04) or 0.04),
+        float(state.get('aave_liq_price', 0) or 0),
+        eth_usd,
+    ))
+
+    any_close = any(p.get('should_close') or p.get('force_close') for p in positions)
+    total_debt = sum(p.get('debt_usd', 0) for p in positions if isinstance(p.get('debt_usd'), (int, float)))
+
+    return {
+        'positions': positions,
+        'total_crypto_debt_usd': round(total_debt, 0),
+        'any_close_signal': any_close,
+        'target': 'zero crypto debt',
+        'method': 'close each independently at GTO optimal — collateral slice repays debt (scoped crypto->USD exception)',
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────
