@@ -521,9 +521,18 @@ def allocate_capital(cycle_pct: float, available_capital: float,
             if eligible_for_primary(yield_usd, float(tvl_m), float(audit_factor)):
                 eligible.append(o)
             else:
+                tvl_fails = float(tvl_m) < PRIMARY_MIN_TVL_M
+                audit_fails = float(audit_factor) < PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR
+                if tvl_fails and audit_fails:
+                    reason = (f"below TVL floor (${tvl_m}M<${PRIMARY_MIN_TVL_M:.0f}M) "
+                              f"AND below audit floor ({audit_factor}<{PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR})")
+                elif tvl_fails:
+                    reason = f"below TVL floor (${tvl_m}M<${PRIMARY_MIN_TVL_M:.0f}M); audit OK"
+                else:
+                    reason = f"below audit floor ({audit_factor}<{PRIMARY_ALLOCATION_MIN_AUDIT_FACTOR}); TVL OK"
                 filtered_protocols.append({"opportunity": o.get("name") or o.get("pool", "?"),
                                            "apy": o.get("apy"), "audit_factor": audit_factor,
-                                           "tvl_m": tvl_m, "reason": "below audit/TVL floor"})
+                                           "tvl_m": tvl_m, "reason": reason})
         if not eligible:
             # No gate-cleared protocol this week — never route to a sub-gate
             # protocol. Redirect the yield-earmarked capital to DCA instead
@@ -821,9 +830,32 @@ def cycle_top_readiness(state: dict) -> dict:
             f'Do not wait for a higher print.'
         )
 
+    # Cycle velocity: pp per week, from percentile history
+    pct_history = state.get('cycle_percentile_history', [])  # list of (date, pct)
+    velocity_pp_per_week = None
+    if len(pct_history) >= 2:
+        # Use last ~4 weeks of readings
+        recent = pct_history[-28:]
+        if len(recent) >= 2:
+            span_days = (date.fromisoformat(recent[-1][0]) - date.fromisoformat(recent[0][0])).days
+            pct_delta = recent[-1][1] - recent[0][1]
+            if span_days > 0:
+                velocity_pp_per_week = (pct_delta / span_days) * 7
+
+    pp_to_staging = max(0, CYCLE_TOP_WARNING_PCT - cycle_pct)
+    if velocity_pp_per_week and velocity_pp_per_week > 0.1:
+        weeks_to_staging = pp_to_staging / velocity_pp_per_week
+        staging_eta = f"~{weeks_to_staging:.0f} weeks at current velocity ({velocity_pp_per_week:+.1f}pp/wk)"
+    elif velocity_pp_per_week is not None and velocity_pp_per_week <= 0:
+        staging_eta = f"receding ({velocity_pp_per_week:+.1f}pp/wk) — top not approaching"
+    else:
+        staging_eta = "velocity unavailable (need percentile history)"
+
     return {
         'cycle_pct': cycle_pct,
         'phase': phase,
+        'staging_eta': staging_eta,
+        'velocity_pp_per_week': velocity_pp_per_week,
         'goal1_debt_closure': {
             'target': 'zero crypto debt',
             'outstanding_usd': round(debt, 0),
@@ -938,6 +970,45 @@ def metals_rotation_signal(state: dict) -> dict:
     }
 
 
+METALS_ROTATION_TARGET_PCT = 0.30  # rotate 30% of liquid crypto to metals at top
+
+
+def metals_rotation_plan(state: dict) -> dict:
+    """
+    GTO-sized metals rotation at cycle top. Rotates a defined fraction of
+    LIQUID crypto (spot BTC/ETH/SOL, NOT staked validators — those keep
+    compounding) into physical gold/silver to lock gains.
+    Validators are NOT rotated — they are the permanent HODL core.
+    """
+    btc_spot_usd = float(state.get('btc_spot_usd', 0) or state.get('btc_usd_value', 0) or 0)
+    # Liquid crypto = spot holdings, excludes staked ETH validators + rETH core
+    liquid_crypto_usd = (
+        float(state.get('btc_usd_value', 0) or 0) +
+        float(state.get('sol_usd_value', 0) or 0)
+        # ETH validators excluded — permanent stake
+    )
+    rotation_usd = liquid_crypto_usd * METALS_ROTATION_TARGET_PCT
+    # Kelly split within metals: gold/silver by relative percentile cheapness
+    gold_pct = float(state.get('gold_percentile', 50))
+    silver_pct = float(state.get('silver_percentile', 50))
+    # Buy the cheaper metal more heavily
+    if gold_pct + silver_pct > 0:
+        gold_weight = silver_pct / (gold_pct + silver_pct)  # inverse — cheaper gets more
+        silver_weight = gold_pct / (gold_pct + silver_pct)
+    else:
+        gold_weight, silver_weight = 0.6, 0.4
+
+    return {
+        'target_pct_of_liquid_crypto': METALS_ROTATION_TARGET_PCT,
+        'liquid_crypto_usd': round(liquid_crypto_usd, 0),
+        'rotation_usd': round(rotation_usd, 0),
+        'validators_excluded': 'ETH validators + rETH remain permanent HODL core — never rotated',
+        'gold_allocation_usd': round(rotation_usd * gold_weight, 0),
+        'silver_allocation_usd': round(rotation_usd * silver_weight, 0),
+        'note': 'Executes only at cycle top (phase TOP_ACTION+) AND after debt cleared',
+    }
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # DEFI DEBT-UNWIND OPTIMIZER
 #
@@ -1001,6 +1072,15 @@ def debt_unwind_optimizer(state: dict) -> dict:
         at_local_min = prev_units is not None and crypto_units_to_close < prev_units
         state[prev_units_key] = crypto_units_to_close
 
+        hist = state.get('debt_close_cost_history', {}).get(name, [])
+        cost_to_close_trend = None
+        if len(hist) >= 7:
+            recent_avg = sum(h[1] for h in hist[-7:]) / 7
+            older_avg = sum(h[1] for h in hist[-14:-7]) / max(1, len(hist[-14:-7]))
+            if older_avg > 0:
+                trend_pct = (recent_avg - older_avg) / older_avg * 100
+                cost_to_close_trend = f"cost-to-close {'falling' if trend_pct<0 else 'rising'} {abs(trend_pct):.1f}% (7d)"
+
         annual_carry = debt_usd * borrow_apr
         force_close = buffer_pct < 0.15
 
@@ -1040,6 +1120,7 @@ def debt_unwind_optimizer(state: dict) -> dict:
             'buffer_pct': round(buffer_pct * 100, 1),
             'status': status,
             'action': action,
+            'cost_to_close_trend': cost_to_close_trend,
         }
 
     eth_usd = float(state.get('eth_usd', 1794))
@@ -1373,6 +1454,22 @@ def satellite_analysis(state: dict) -> dict:
     }
 
     return {"lit": lit, "vvv": vvv}
+
+
+def supply_overhang(state: dict) -> dict:
+    """Track known structural BTC/ETH supply overhangs that suppress price
+    (forced sellers, unlocks). These CREATE the cheap DCA prices — context,
+    not alarm. Populated from state['supply_overhang_events'] (manually or
+    news-fed)."""
+    events = state.get('supply_overhang_events', [])
+    active = [e for e in events if e.get('active', True)]
+    total_usd = sum(float(e.get('size_usd', 0) or 0) for e in active)
+    return {
+        'active_count': len(active),
+        'total_overhang_usd': round(total_usd, 0),
+        'events': active[:3],
+        'thesis_note': 'Forced supply suppresses price — creates cheap DCA entries the accumulation thesis exploits. Not a sell signal.',
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────
