@@ -234,15 +234,28 @@ def dca_health(state: dict) -> dict:
     """Flags a stalled Kraken DCA leg. hours_since_last_dca_fill should be the
     MOST STALE of the three tracked assets (BTC/ETH/SOL), not the most recent
     fill across any asset — an actively-firing asset can otherwise mask a
-    halted one (e.g. SOL firing nightly while BTC/ETH automation is down)."""
+    halted one (e.g. SOL firing nightly while BTC/ETH automation is down).
+
+    A user-confirmed manual pause (state['dca_manual_pause'], set via
+    manage_state.py --pause-dca) suppresses the alert — a deliberate pause
+    awaiting capital is not an automation fault. It still surfaces as
+    'paused', not silently, so it doesn't look identical to a healthy week."""
     last_fill_hrs = state.get("hours_since_last_dca_fill")
     last_fill_hrs = float(last_fill_hrs) if last_fill_hrs is not None else 0.0
-    stale = last_fill_hrs > DCA_STALE_HOURS
+    pause = state.get("dca_manual_pause") or {}
+    paused = bool(pause.get("active"))
+    stale = (not paused) and last_fill_hrs > DCA_STALE_HOURS
+    alert = None
+    if paused:
+        alert = f"DCA PAUSED (user-confirmed) — {pause.get('reason') or 'awaiting capital to deploy'}"
+    elif stale:
+        alert = f"DCA STALE — no Kraken fill in {last_fill_hrs:.0f}h, check automation"
     return {
         "last_fill_hrs": round(last_fill_hrs, 1),
         "stale": stale,
-        "alert": (f"DCA STALE — no Kraken fill in {last_fill_hrs:.0f}h, check automation"
-                  if stale else None),
+        "paused": paused,
+        "pause_reason": pause.get("reason") if paused else None,
+        "alert": alert,
     }
 
 
