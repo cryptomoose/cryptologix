@@ -197,6 +197,56 @@ def gto_multiplier(cycle_pct: float) -> float:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# WEEKLY DCA BUDGET — single source of truth
+#
+# Every headline weekly-DCA figure (report header, CHANGES, ACTIONS, WEEK
+# AHEAD, capital router, Kraken fill-progress target) must read this, not
+# recompute or hardcode its own total. Previously two figures disagreed:
+# advisor_prompt's own $777-baseline calc vs kraken_client's separate
+# DAILY_TARGETS-derived $855.47 (a stale pre-GTO Kraken-automation figure) —
+# the two were never the same number by construction.
+# ────────────────────────────────────────────────────────────────────────────
+DCA_BASELINE_WEEKLY = 777.0  # user-set weekly baseline, do not hardcode elsewhere
+
+
+def weekly_dca_budget(state: dict) -> dict:
+    """Weekly DCA budget = baseline * continuous GTO multiplier.
+
+    Accepts a crypto_state.json-shaped dict (reads state['ratios']['gto_multiplier']
+    or state['gto_multiplier']) or a ratios dict directly."""
+    r = state.get("ratios", state) or {}
+    mult = state.get("gto_multiplier")
+    if mult is None:
+        mult = r.get("gto_multiplier", 1.0)
+    mult = float(mult or 1.0)
+    baseline = DCA_BASELINE_WEEKLY
+    return {
+        "baseline": baseline,
+        "multiplier": round(mult, 2),
+        "total": round(baseline * mult, 2),
+    }
+
+
+DCA_STALE_HOURS = 48.0  # a silent DCA halt is the highest-cost failure mode — alert loudly
+
+
+def dca_health(state: dict) -> dict:
+    """Flags a stalled Kraken DCA leg. hours_since_last_dca_fill should be the
+    MOST STALE of the three tracked assets (BTC/ETH/SOL), not the most recent
+    fill across any asset — an actively-firing asset can otherwise mask a
+    halted one (e.g. SOL firing nightly while BTC/ETH automation is down)."""
+    last_fill_hrs = state.get("hours_since_last_dca_fill")
+    last_fill_hrs = float(last_fill_hrs) if last_fill_hrs is not None else 0.0
+    stale = last_fill_hrs > DCA_STALE_HOURS
+    return {
+        "last_fill_hrs": round(last_fill_hrs, 1),
+        "stale": stale,
+        "alert": (f"DCA STALE — no Kraken fill in {last_fill_hrs:.0f}h, check automation"
+                  if stale else None),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # EXPECTED RETURN (empirical, no hardcoded guesses)
 # ────────────────────────────────────────────────────────────────────────────
 def expected_90d_return(cycle_pct: float, historical_data: dict = None,
