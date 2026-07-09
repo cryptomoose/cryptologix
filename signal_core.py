@@ -22,6 +22,7 @@ Design principles:
 import math
 import hashlib
 import os
+import re
 import logging
 from datetime import date
 
@@ -259,6 +260,43 @@ def dca_health(state: dict) -> dict:
     }
 
 
+def paused_dca_cost(state: dict):
+    """Quantify forgone expected value while DCA sits on a user-confirmed
+    manual pause (state['dca_manual_pause']['active'], set via
+    manage_state.py --pause-dca / --resume-dca). Returns None if not paused.
+
+    This is not an instruction to resume — it prices the decision so the
+    pause is deliberate rather than passive."""
+    paused = bool((state.get('dca_manual_pause') or {}).get('active'))
+    if not paused:
+        return None
+
+    weekly_budget = float((state.get('dca_budget') or {}).get('total', 0) or 0)
+    hours_paused = float(state.get('hours_since_last_dca_fill', 0) or 0)
+    weeks_paused = hours_paused / 168.0
+    cycle_pct = float(state.get('cycle_percentile', 50))
+    exp_90d = float(state.get('expected_90d_return', 0) or 0)
+
+    undeployed = weekly_budget * weeks_paused
+    # Forgone EV = undeployed capital × median 90d expected return
+    forgone_ev_90d = undeployed * exp_90d
+
+    return {
+        'weeks_paused': round(weeks_paused, 1),
+        'weekly_budget': round(weekly_budget, 2),
+        'undeployed_usd': round(undeployed, 0),
+        'cycle_pct': cycle_pct,
+        'expected_90d_return_pct': round(exp_90d * 100, 1),
+        'forgone_ev_90d_usd': round(forgone_ev_90d, 0),
+        'note': (
+            f"${undeployed:,.0f} undeployed over {weeks_paused:.1f}wk at "
+            f"{cycle_pct:.1f}th pct. Model E[90d] +{exp_90d*100:.1f}% implies "
+            f"~${forgone_ev_90d:,.0f} forgone expected value. "
+            f"Pause is user-confirmed — this prices the decision, not a directive."
+        ),
+    }
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # EXPECTED RETURN (empirical, no hardcoded guesses)
 # ────────────────────────────────────────────────────────────────────────────
@@ -492,6 +530,106 @@ def eligible_for_primary(allocation_usd: float, tvl_millions: float,
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# PROTOCOL CONCENTRATION GATE
+#
+# The audit/TVL gate above scores each protocol independently — it can't see
+# that "sky-lending USDS" and MakerDAO Vaults 30698/31944 share the same
+# governance/smart-contract blast radius (Sky = MakerDAO rebranded; a
+# governance action, oracle failure, or emergency shutdown hits both the
+# yield sleeve and the collateral stack at once). This gate runs BEFORE the
+# audit/TVL gate in allocate_capital and blocks any allocation that would
+# push a correlated protocol family above 5% of NAV, counting BOTH existing
+# collateral and debt (a governance failure impairs both sides).
+# ────────────────────────────────────────────────────────────────────────────
+CONCENTRATION_LIMIT_PCT = 0.05   # max 5% of NAV per protocol family
+
+# Map protocol identifiers to their governance/risk family. Same family =
+# same smart-contract + governance blast radius.
+PROTOCOL_FAMILY = {
+    'sky-lending': 'maker_sky',
+    'sky': 'maker_sky',
+    'makerdao': 'maker_sky',
+    'spark': 'maker_sky',        # Spark is a Sky subDAO
+    'usds': 'maker_sky',
+    'dai': 'maker_sky',
+    'susds': 'maker_sky',
+    'aave': 'aave',
+    'aave-v3': 'aave',
+    'rocketpool': 'rocketpool',
+    'reth': 'rocketpool',
+    'rpl': 'rocketpool',
+    'lido': 'lido',
+    'wsteth': 'lido',            # wstETH is Lido — collateral in Maker vaults
+}
+
+
+def _family(name: str) -> str:
+    """Token match, not substring — substring containment false-positives on
+    names like "sUSDai" (contains "dai") or "SkyHarbor" (contains "sky") that
+    share no actual governance relationship with Maker/Sky."""
+    tokens = set(re.split(r'[^a-z0-9]+', str(name).lower().strip()))
+    tokens.discard('')
+    for k, fam in PROTOCOL_FAMILY.items():
+        k_tokens = set(re.split(r'[^a-z0-9]+', k))
+        if k_tokens & tokens:
+            return fam
+    return str(name).lower().strip()  # unknown protocols are their own family
+
+
+def existing_protocol_exposure(state: dict) -> dict:
+    """Current USD exposure per protocol family from live positions. Counts
+    BOTH collateral and debt — a governance failure impairs both."""
+    nav = float(state.get('portfolio_usd', 1) or 1)
+    exposure = {}
+
+    def add(family, usd):
+        exposure[family] = exposure.get(family, 0) + float(usd or 0)
+
+    # Maker/Sky vaults: collateral is the exposure at risk
+    add('maker_sky', state.get('vault_30698_collateral_usd', 0))
+    add('maker_sky', state.get('vault_31944_collateral_usd', 0))
+    # wstETH collateral is ALSO Lido exposure (dual-family)
+    add('lido', state.get('vault_30698_collateral_usd', 0))
+    add('lido', state.get('vault_31944_collateral_usd', 0))
+    # Aave
+    add('aave', state.get('aave_collateral_usd', 0))
+    # Rocketpool: validators + rETH
+    add('rocketpool', state.get('eth_staked_usd', 0))
+    add('rocketpool', state.get('reth_usd_value', 0))
+
+    return {
+        fam: {'usd': round(usd, 0), 'pct_of_nav': round(usd / nav * 100, 2)}
+        for fam, usd in exposure.items()
+    }
+
+
+def concentration_check(protocol_name: str, allocation_usd: float,
+                        state: dict) -> tuple:
+    """Returns (allowed, reason). Blocks any allocation that would push a
+    protocol family above CONCENTRATION_LIMIT_PCT of NAV. With no real NAV
+    in state (portfolio_usd missing/<=0 — e.g. a caller that didn't pass
+    live state), the gate is a no-op rather than maximally restrictive:
+    without a real NAV, any allocation_usd would divide by the ~$1
+    placeholder and "exceed" the limit trivially."""
+    nav = float(state.get('portfolio_usd', 0) or 0)
+    if nav <= 0:
+        return True, "concentration OK (no portfolio_usd in state)"
+    fam = _family(protocol_name)
+    exposure = existing_protocol_exposure(state)
+    current_usd = exposure.get(fam, {}).get('usd', 0)
+    projected_pct = (current_usd + allocation_usd) / nav
+
+    if projected_pct > CONCENTRATION_LIMIT_PCT:
+        return False, (
+            f"CONCENTRATION BLOCK — {fam} family already {current_usd/nav*100:.1f}% "
+            f"of NAV (${current_usd:,.0f}); adding ${allocation_usd:,.0f} → "
+            f"{projected_pct*100:.1f}% exceeds {CONCENTRATION_LIMIT_PCT*100:.0f}% limit. "
+            f"Correlated blast radius with existing collateral/debt."
+        )
+    return True, "concentration OK"
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # CYCLE-CONDITIONAL CAPITAL ROUTER
 #
 # dca_frac is Kelly-derived, not an arbitrary step function. At each cycle
@@ -547,13 +685,20 @@ def _kelly_dca_fraction(cycle_pct: float, best_yield_apy: float = 12.0) -> float
 
 
 def allocate_capital(cycle_pct: float, available_capital: float,
-                     yield_opportunities: list = None) -> dict:
+                     yield_opportunities: list = None, state: dict = None) -> dict:
     """Route weekly deployable capital between spot DCA and yield positions
     via the Kelly-derived _kelly_dca_fraction (see module note above).
 
     yield_opportunities: [{"name": str, "apy": float, ...}] sorted or not;
     yield capital is split across the top 3 by APY, 50/30/20; the best APY
-    among them (or 12.0 default) is passed to _kelly_dca_fraction."""
+    among them (or 12.0 default) is passed to _kelly_dca_fraction.
+
+    state: crypto_state.json-shaped dict, used by the protocol concentration
+    gate (concentration_check) to see existing collateral/debt exposure.
+    Omitted or empty means the concentration gate is a no-op (existing
+    exposure reads as 0 for every family) — callers with live portfolio
+    state should always pass it."""
+    state = state or {}
     p = min(max(float(cycle_pct), 0.0), 100.0)
     cap = max(0.0, float(available_capital))
     best_yield_apy = 12.0
@@ -576,10 +721,23 @@ def allocate_capital(cycle_pct: float, available_capital: float,
         for o in yield_opportunities:
             tvl_m = o.get("tvl_m")
             audit_factor = o.get("audit_factor")
+            _name = o.get("name") or o.get("pool", "?")
             if audit_factor is None or tvl_m is None:
-                filtered_protocols.append({"opportunity": o.get("name") or o.get("pool", "?"),
+                filtered_protocols.append({"opportunity": _name,
                                            "apy": o.get("apy"), "audit_factor": audit_factor,
                                            "tvl_m": tvl_m, "reason": "missing audit_factor/tvl_m"})
+                continue
+            # Concentration gate runs BEFORE the audit/TVL gate — a protocol
+            # can clear audit/TVL and still correlate with existing
+            # collateral/debt (e.g. sky-lending USDS vs Maker vault
+            # collateral). Tested against the full yield_usd since that's
+            # the maximum this protocol could receive if it's the only one
+            # that clears the remaining gates.
+            _conc_ok, _conc_reason = concentration_check(_name, yield_usd, state)
+            if not _conc_ok:
+                filtered_protocols.append({"opportunity": _name,
+                                           "apy": o.get("apy"), "audit_factor": audit_factor,
+                                           "tvl_m": tvl_m, "reason": _conc_reason})
                 continue
             if eligible_for_primary(yield_usd, float(tvl_m), float(audit_factor)):
                 eligible.append(o)
@@ -611,7 +769,7 @@ def allocate_capital(cycle_pct: float, available_capital: float,
                               "apy": o.get("apy"),
                               "amount": round(yield_usd * s / norm, 2)})
     no_gate_cleared_note = (
-        "no gate-cleared protocol (all candidates below $75M TVL or audit <0.8 this week)"
+        "Yield $0 — no protocol clears concentration + audit/TVL gates this week"
         if yield_usd == 0 and filtered_protocols and not slots else None
     )
     return {"dca": dca_usd, "yield_usd": yield_usd, "yield_slots": slots,
@@ -906,13 +1064,15 @@ def cycle_top_readiness(state: dict) -> dict:
                 velocity_pp_per_week = (pct_delta / span_days) * 7
 
     pp_to_staging = max(0, CYCLE_TOP_WARNING_PCT - cycle_pct)
-    if velocity_pp_per_week and velocity_pp_per_week > 0.1:
+    if velocity_pp_per_week is None:
+        staging_eta = "velocity unavailable (need percentile history)"
+    elif velocity_pp_per_week > 0.1:
         weeks_to_staging = pp_to_staging / velocity_pp_per_week
         staging_eta = f"~{weeks_to_staging:.0f} weeks at current velocity ({velocity_pp_per_week:+.1f}pp/wk)"
-    elif velocity_pp_per_week is not None and velocity_pp_per_week <= 0:
+    elif velocity_pp_per_week < -0.1:
         staging_eta = f"receding ({velocity_pp_per_week:+.1f}pp/wk) — top not approaching"
     else:
-        staging_eta = "velocity unavailable (need percentile history)"
+        staging_eta = f"flat (±0.0pp/wk) — no directional signal"
 
     return {
         'cycle_pct': cycle_pct,
