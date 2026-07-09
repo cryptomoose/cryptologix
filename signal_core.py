@@ -1522,16 +1522,34 @@ def satellite_analysis(state: dict) -> dict:
 def supply_overhang(state: dict) -> dict:
     """Track known structural BTC/ETH supply overhangs that suppress price
     (forced sellers, unlocks). These CREATE the cheap DCA prices — context,
-    not alarm. Populated from state['supply_overhang_events'] (manually or
-    news-fed)."""
-    events = state.get('supply_overhang_events', [])
-    active = [e for e in events if e.get('active', True)]
-    total_usd = sum(float(e.get('size_usd', 0) or 0) for e in active)
+    not alarm. Sourced live from state['strategy_monitor'] (EDGAR 8-K
+    parsing of Strategy's actual realized BTC sales — see strategy_monitor.py),
+    not a static authorized-capacity figure: authorized ≠ sold."""
+    sm = state.get('strategy_monitor') or {}
+    if not sm:
+        return {'active_count': 0, 'line': None}
+
+    auth = sm.get('authorized', {})
+    real = sm.get('realized', {})
+    rr = sm.get('run_rate', {})
+
+    realized_usd = real.get('cumulative_usd_proceeds', 0)
+    realized_btc = real.get('cumulative_btc_sold', 0)
+    weekly = rr.get('weekly_usd_run_rate', 0)
+    monthly_btc = rr.get('implied_monthly_btc_supply', 0)
+    esc = ' ⚠ ESCALATING' if rr.get('escalating') else ''
+
+    line = (
+        f"Supply overhang: Strategy ≥${auth.get('capped_total_usd', 0) / 1e9:.2f}B "
+        f"authorized (1 uncapped bucket) | realized ${realized_usd / 1e6:.0f}M "
+        f"({realized_btc:,} BTC) | run-rate ${weekly / 1e6:.0f}M/wk "
+        f"→ ~{monthly_btc:,.0f} BTC/mo{esc} — suppresses price, feeds DCA thesis"
+    )
     return {
-        'active_count': len(active),
-        'total_overhang_usd': round(total_usd, 0),
-        'events': active[:3],
-        'thesis_note': 'Forced supply suppresses price — creates cheap DCA entries the accumulation thesis exploits. Not a sell signal.',
+        'active_count': 1,
+        'line': line,
+        'escalating': rr.get('escalating', False),
+        'months_coverage': sm.get('solvency', {}).get('months_coverage'),
     }
 
 
