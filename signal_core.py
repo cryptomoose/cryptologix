@@ -984,6 +984,80 @@ CYCLE_TOP_ACTION_PCT = 85.0     # cycle-top actions become live
 CYCLE_TOP_URGENT_PCT = 92.0     # execute — top is near
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# CYCLE VELOCITY — OLS SLOPE, ADAPTIVE WINDOW
+#
+# Replaces a 2-point endpoint secant (recent[-1] - recent[0] over the last
+# 28 readings) that used only the two ends of the window and ignored every
+# point between them — a single new day's reading could swing the "weekly
+# velocity" estimate 4x overnight (283wk -> 72wk ETA to staging on 2026-07-10)
+# even though the 28-day window itself was long enough to be stable, because
+# the two endpoints aren't a stable statistic on their own. An OLS slope
+# over the same window uses every point, so one new day only nudges the
+# fit instead of redefining it.
+#
+# Window is adaptive because only 30 days of cycle_percentile_history exist
+# as of 2026-07-10: a 21d/28d OLS window can still be dominated by a single
+# mid-window trough (see 2026-06-25..07-01 dip) while history is this thin.
+# Prefer the shorter, more-recent 14d window until enough history (>45
+# points) accumulates to make longer windows trustworthy, then prefer 21d.
+# ────────────────────────────────────────────────────────────────────────────
+def _velocity_ols(pct_history: list, window_days: int):
+    """OLS slope (pp/week) over the trailing window_days of
+    cycle_percentile_history. pct_history: chronological [(date_str, pct)].
+    Returns None if fewer than 5 points fall within the window."""
+    if not pct_history:
+        return None
+    cutoff = date.today().toordinal() - window_days
+    pts = [(date.fromisoformat(d).toordinal(), p) for d, p in pct_history
+           if date.fromisoformat(d).toordinal() >= cutoff]
+    n = len(pts)
+    if n < 5:
+        return None
+    x0 = pts[0][0]
+    xs = [p[0] - x0 for p in pts]  # numerical stability
+    ys = [p[1] for p in pts]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    den = sum((x - mean_x) ** 2 for x in xs)
+    if den == 0:
+        return None
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    return (num / den) * 7  # pp/day -> pp/week
+
+
+def cycle_top_velocity(state: dict) -> dict:
+    """Adaptive-window OLS velocity estimate for cycle_percentile_history
+    (see module note above). Never a 2-point endpoint secant."""
+    pct_history = state.get('cycle_percentile_history', [])
+    windows_by_pref = (14, 21, 28, 10) if len(pct_history) < 45 else (21, 14, 28, 10)
+
+    computed = {w: _velocity_ols(pct_history, w) for w in (10, 14, 21, 28)}
+    available = [(w, v) for w, v in computed.items() if v is not None]
+    if not available:
+        return {
+            'velocity_pp_per_week': None,
+            'window_days': None,
+            'method': 'insufficient_history',
+            'all_windows': {},
+            'note': 'Fewer than 5 percentile readings in any window — need more days of history.',
+        }
+
+    chosen_window = next(w for w in windows_by_pref if computed.get(w) is not None)
+    chosen_velocity = computed[chosen_window]
+
+    return {
+        'velocity_pp_per_week': round(chosen_velocity, 3),
+        'window_days': chosen_window,
+        'method': f'ols_slope_{chosen_window}d',
+        'all_windows': {f'{w}d': round(v, 3) for w, v in sorted(available)},
+        'note': (
+            f'OLS slope over trailing {chosen_window}d ({len(pct_history)} total '
+            f'readings available). Will prefer 21d once >45 days of history exist.'
+        ),
+    }
+
+
 def cycle_top_readiness(state: dict) -> dict:
     """
     Tracks readiness for the two near-term cycle-top goals:
@@ -1051,28 +1125,24 @@ def cycle_top_readiness(state: dict) -> dict:
             f'Do not wait for a higher print.'
         )
 
-    # Cycle velocity: pp per week, from percentile history
-    pct_history = state.get('cycle_percentile_history', [])  # list of (date, pct)
-    velocity_pp_per_week = None
-    if len(pct_history) >= 2:
-        # Use last ~4 weeks of readings
-        recent = pct_history[-28:]
-        if len(recent) >= 2:
-            span_days = (date.fromisoformat(recent[-1][0]) - date.fromisoformat(recent[0][0])).days
-            pct_delta = recent[-1][1] - recent[0][1]
-            if span_days > 0:
-                velocity_pp_per_week = (pct_delta / span_days) * 7
+    # Cycle velocity: pp per week, from percentile history (OLS, adaptive
+    # window — see cycle_top_velocity above)
+    velocity = cycle_top_velocity(state)
+    velocity_pp_per_week = velocity['velocity_pp_per_week']
+    velocity_window_days = velocity['window_days']
 
     pp_to_staging = max(0, CYCLE_TOP_WARNING_PCT - cycle_pct)
     if velocity_pp_per_week is None:
         staging_eta = "velocity unavailable (need percentile history)"
     elif velocity_pp_per_week > 0.1:
         weeks_to_staging = pp_to_staging / velocity_pp_per_week
-        staging_eta = f"~{weeks_to_staging:.0f} weeks at current velocity ({velocity_pp_per_week:+.1f}pp/wk)"
+        staging_eta = (f"~{weeks_to_staging:.0f} weeks at current velocity "
+                        f"({velocity_pp_per_week:+.2f}pp/wk, {velocity_window_days}d OLS)")
     elif velocity_pp_per_week < -0.1:
-        staging_eta = f"receding ({velocity_pp_per_week:+.1f}pp/wk) — top not approaching"
+        staging_eta = (f"receding ({velocity_pp_per_week:+.2f}pp/wk, {velocity_window_days}d OLS) "
+                        f"— top not approaching")
     else:
-        staging_eta = f"flat (±0.0pp/wk) — no directional signal"
+        staging_eta = f"flat (±0.0pp/wk, {velocity_window_days}d OLS) — no directional signal"
 
     return {
         'cycle_pct': cycle_pct,
