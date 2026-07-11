@@ -1749,6 +1749,138 @@ def satellite_analysis(state: dict) -> dict:
     return {"lit": lit, "vvv": vvv}
 
 
+def leverage_stress_test(state: dict) -> dict:
+    """Read-only ETH price-shock stress test across every ETH-collateralized
+    debt position (Aave + Maker vaults 30698/31944). Debt on all three is
+    stablecoin-denominated while collateral is ETH/wstETH, so collateral
+    value — and therefore HF/collateral-ratio — scales linearly with the ETH
+    price; each position's liq_price (already computed by the collector as
+    the ETH price at which it gets liquidated) doesn't move under the shock.
+    That means "shocked_eth_usd < liq_price" is exactly the liquidation
+    trigger, no re-derivation of liquidation thresholds needed.
+
+    Scenarios are -15%/-30%/-50% ETH price shocks (mild/moderate/severe).
+    Purely informational — fires no alerts and mutates nothing."""
+    prices = state.get("prices") or {}
+    eth_usd = float(state.get("eth_usd") or prices.get("eth_usd") or 0)
+    if not eth_usd:
+        return {"error": "eth_usd unavailable"}
+
+    positions = [
+        {"name": "Aave (wstETH/USDC)", "metric": "health_factor",
+         "current": float(state.get("aave_hf") or 0),
+         "liq_price": float(state.get("aave_liq_price") or 0)},
+        {"name": "Maker vault 30698", "metric": "collateral_ratio_pct",
+         "current": float(state.get("vault_30698_ratio") or 0),
+         "liq_price": float(state.get("vault_30698_liq_price") or 0)},
+        {"name": "Maker vault 31944", "metric": "collateral_ratio_pct",
+         "current": float(state.get("vault_31944_ratio") or 0),
+         "liq_price": float(state.get("vault_31944_liq_price") or 0)},
+    ]
+
+    scenarios = {}
+    any_liquidation_risk_at_severe = False
+    for label, pct in (("mild", 0.15), ("moderate", 0.30), ("severe", 0.50)):
+        shocked_eth = eth_usd * (1 - pct)
+        scale = shocked_eth / eth_usd
+        rows = []
+        for p in positions:
+            if not p["current"] or not p["liq_price"]:
+                continue
+            liquidated = shocked_eth < p["liq_price"]
+            if label == "severe" and liquidated:
+                any_liquidation_risk_at_severe = True
+            rows.append({
+                "name": p["name"],
+                "metric": p["metric"],
+                "current": round(p["current"], 4),
+                "shocked": round(p["current"] * scale, 4),
+                "liq_price": round(p["liq_price"], 2),
+                "liquidated": liquidated,
+                "pct_headroom_to_liq_price": round((shocked_eth - p["liq_price"]) / p["liq_price"] * 100, 1),
+            })
+        scenarios[label] = {
+            "eth_shock_pct": -pct * 100,
+            "shocked_eth_usd": round(shocked_eth, 2),
+            "positions": rows,
+        }
+
+    return {
+        "eth_usd_current": eth_usd,
+        "scenarios": scenarios,
+        "any_liquidation_risk_at_severe": any_liquidation_risk_at_severe,
+    }
+
+
+SATELLITE_CORR_MIN_DAYS = 15  # below this, a return-series correlation is noise, not signal
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 2:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / math.sqrt(vx * vy)
+
+
+def satellite_correlation(state: dict) -> dict:
+    """Rolling daily-return correlation of each satellite asset (LIT/VVV/RPL/
+    HYPE) vs BTC and vs ETH. Purely informational — no position sizing or
+    alerts derive from this, it's context for whether a satellite is adding
+    diversification or just riding BTC/ETH beta.
+
+    Reads state['satellite_price_history'], a list of daily
+    {date, btc_usd, eth_usd, lit_usd, vvv_usd, rpl_usd, hype_usd} snapshots
+    appended by the collector (missing keys on a given day are fine — dates
+    are aligned per-asset before the return series is built). Needs
+    >= SATELLITE_CORR_MIN_DAYS aligned day-over-day returns per asset;
+    returns 'insufficient_data' status per-asset until then rather than a
+    correlation computed on a handful of noisy points."""
+    history = [e for e in (state.get("satellite_price_history") or []) if e.get("date")]
+    history.sort(key=lambda e: e["date"])
+
+    def daily_returns(key):
+        series = [(e["date"], e[key]) for e in history if e.get(key)]
+        out = {}
+        for (d0, p0), (d1, p1) in zip(series, series[1:]):
+            if p0:
+                out[d1] = (p1 / p0) - 1
+        return out
+
+    btc_r = daily_returns("btc_usd")
+    eth_r = daily_returns("eth_usd")
+
+    out = {}
+    for name, key in (("lit", "lit_usd"), ("vvv", "vvv_usd"), ("rpl", "rpl_usd"), ("hype", "hype_usd")):
+        sat_r = daily_returns(key)
+        dates_btc = sorted(set(sat_r) & set(btc_r))
+        dates_eth = sorted(set(sat_r) & set(eth_r))
+        if len(dates_btc) < SATELLITE_CORR_MIN_DAYS or len(dates_eth) < SATELLITE_CORR_MIN_DAYS:
+            out[name] = {
+                "status": "insufficient_data",
+                "n_days_vs_btc": len(dates_btc),
+                "n_days_vs_eth": len(dates_eth),
+                "vs_btc": None,
+                "vs_eth": None,
+            }
+            continue
+        corr_btc = _pearson([sat_r[d] for d in dates_btc], [btc_r[d] for d in dates_btc])
+        corr_eth = _pearson([sat_r[d] for d in dates_eth], [eth_r[d] for d in dates_eth])
+        out[name] = {
+            "status": "ok",
+            "n_days_vs_btc": len(dates_btc),
+            "n_days_vs_eth": len(dates_eth),
+            "vs_btc": round(corr_btc, 3) if corr_btc is not None else None,
+            "vs_eth": round(corr_eth, 3) if corr_eth is not None else None,
+        }
+    return out
+
+
 def supply_overhang(state: dict) -> dict:
     """Track known structural BTC/ETH supply overhangs that suppress price
     (forced sellers, unlocks). These CREATE the cheap DCA prices — context,
