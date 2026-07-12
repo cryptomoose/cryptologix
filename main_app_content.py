@@ -186,83 +186,102 @@ def render_crypto_app():
         # correlation (signal_core, shared verbatim with willie-agent-stack/crypto).
         # General market data only (gold/silver/BTC/ETH price history) — no personal
         # portfolio, debt, or confirmation-gate state is read or shown here.
-        from signal_core import (gold_silver_ratio_signal, ratio_move_decomposition,
-                                 metals_tail_correlation)
+        #
+        # The whole section is wrapped defensively: it makes its own lightweight
+        # yfinance calls (period='6mo', not LongTermDataFetcher's 'max'/10+-year
+        # fetches — the signal functions only need the trailing ~90 days, and
+        # reusing the 'max' fetchers here would quadruple this page's Yahoo
+        # Finance load on top of what InvestmentSignalEngine already does). A
+        # failure here (rate limit, network hiccup) must degrade to a caption,
+        # never take down the rest of the DCA Strategy tab.
+        try:
+            from signal_core import (gold_silver_ratio_signal, ratio_move_decomposition,
+                                     metals_tail_correlation)
 
-        @st.cache_data(ttl=21600, show_spinner=False)
-        def get_metals_relationship_state():
-            fetcher = LongTermDataFetcher()
+            @st.cache_data(ttl=21600, show_spinner=False)
+            def get_metals_relationship_state():
+                import yfinance as yf
 
-            def _series(df):
-                if df is None or df.empty:
-                    return []
-                tail = df['Close'].dropna().tail(90)
-                return [[idx.strftime('%Y-%m-%d'), float(val)] for idx, val in tail.items()]
+                def _series(symbol):
+                    try:
+                        hist = yf.Ticker(symbol).history(period='6mo', interval='1d', auto_adjust=True)
+                        if hist is None or hist.empty:
+                            return []
+                        if hist.index.tz is not None:
+                            hist.index = hist.index.tz_localize(None)
+                        tail = hist['Close'].dropna().tail(90)
+                        return [[idx.strftime('%Y-%m-%d'), float(val)] for idx, val in tail.items()]
+                    except Exception:
+                        return []
 
-            gold_hist = _series(fetcher.get_comprehensive_gold_data())
-            silver_hist = _series(fetcher.get_comprehensive_silver_data())
-            return {
-                'gold_usd': gold_hist[-1][1] if gold_hist else 0,
-                'silver_usd': silver_hist[-1][1] if silver_hist else 0,
-                'gold_price_history': gold_hist,
-                'silver_price_history': silver_hist,
-                'btc_price_history': _series(fetcher.get_comprehensive_crypto_data('BTC-USD')),
-                'eth_price_history': _series(fetcher.get_comprehensive_crypto_data('ETH-USD')),
-            }
+                gold_hist = _series('GC=F')
+                silver_hist = _series('SI=F')
+                return {
+                    'gold_usd': gold_hist[-1][1] if gold_hist else 0,
+                    'silver_usd': silver_hist[-1][1] if silver_hist else 0,
+                    'gold_price_history': gold_hist,
+                    'silver_price_history': silver_hist,
+                    'btc_price_history': _series('BTC-USD'),
+                    'eth_price_history': _series('ETH-USD'),
+                }
 
-        _metals_state = get_metals_relationship_state()
-        _gsr = gold_silver_ratio_signal(_metals_state)
-        _rd = ratio_move_decomposition(_metals_state)
-        _mtc = metals_tail_correlation(_metals_state)
+            _metals_state = get_metals_relationship_state()
+            _gsr = gold_silver_ratio_signal(_metals_state)
+            _rd = ratio_move_decomposition(_metals_state)
+            _mtc = metals_tail_correlation(_metals_state)
 
-        with st.expander("⚖️ Metals Relationship (Gold/Silver Ratio, ratio-move decomposition, tail correlation)", expanded=False):
-            if _gsr.get('status') == 'ok':
-                g1, g2, g3 = st.columns(3)
-                g1.metric("Gold/Silver Ratio", f"{_gsr['gsr']:.2f}")
-                g2.metric(
-                    "GSR Percentile",
-                    f"{_gsr['gsr_percentile']}th" if _gsr.get('gsr_percentile') is not None else "N/A",
-                    help=_gsr['gsr_percentile_note'],
-                )
-                g3.metric("Absolute Read", _gsr['absolute_read'])
-                # Note: the caveat string from signal_core references willie's
-                # personal "Goal 2" cycle-top framework, which is meaningless to
-                # public users — show a generic public-facing caveat here instead
-                # of the raw string, rather than editing the shared library file.
-                st.caption(
-                    "Central bank structural gold demand may be shifting the "
-                    "historical distribution — treat percentile and absolute "
-                    "read as two independent checks, not a single number. "
-                    "Informational context only."
-                )
-            else:
-                st.info(f"GSR unavailable: {_gsr.get('reason', 'no data')}")
+            with st.expander("⚖️ Metals Relationship (Gold/Silver Ratio, ratio-move decomposition, tail correlation)", expanded=False):
+                if _gsr.get('status') == 'ok':
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("Gold/Silver Ratio", f"{_gsr['gsr']:.2f}")
+                    g2.metric(
+                        "GSR Percentile",
+                        f"{_gsr['gsr_percentile']}th" if _gsr.get('gsr_percentile') is not None else "N/A",
+                        help=_gsr['gsr_percentile_note'],
+                    )
+                    g3.metric("Absolute Read", _gsr['absolute_read'])
+                    # Note: the caveat string from signal_core references willie's
+                    # personal "Goal 2" cycle-top framework, which is meaningless to
+                    # public users — show a generic public-facing caveat here instead
+                    # of the raw string, rather than editing the shared library file.
+                    st.caption(
+                        "Central bank structural gold demand may be shifting the "
+                        "historical distribution — treat percentile and absolute "
+                        "read as two independent checks, not a single number. "
+                        "Informational context only."
+                    )
+                else:
+                    st.info(f"GSR unavailable: {_gsr.get('reason', 'no data')}")
 
-            st.markdown("**14-Day Ratio-Move Decomposition** — did the move come from crypto or from gold?")
-            d1, d2 = st.columns(2)
-            for _col, _label, _leg in ((d1, "BTC/Gold", _rd.get('btc_gold', {})),
-                                        (d2, "ETH/Gold", _rd.get('eth_gold', {}))):
-                with _col:
-                    st.markdown(f"*{_label}*")
-                    if _leg.get('status') == 'ok':
-                        st.write(f"Crypto {_leg['crypto_chg_pct']:+.1f}% vs Gold {_leg['gold_chg_pct']:+.1f}%")
-                        st.write(f"Dominant leg: **{_leg['dominant_leg']}**")
-                        if _leg.get('gold_driven_spike_flag'):
-                            st.warning("⚠️ Gold-driven spike — move may mean-revert faster than a fundamental crypto move.")
-                        st.caption(_leg['interpretation'])
-                    else:
-                        st.caption("Insufficient price history yet.")
+                st.markdown("**14-Day Ratio-Move Decomposition** — did the move come from crypto or from gold?")
+                d1, d2 = st.columns(2)
+                for _col, _label, _leg in ((d1, "BTC/Gold", _rd.get('btc_gold', {})),
+                                            (d2, "ETH/Gold", _rd.get('eth_gold', {}))):
+                    with _col:
+                        st.markdown(f"*{_label}*")
+                        if _leg.get('status') == 'ok':
+                            st.write(f"Crypto {_leg['crypto_chg_pct']:+.1f}% vs Gold {_leg['gold_chg_pct']:+.1f}%")
+                            st.write(f"Dominant leg: **{_leg['dominant_leg']}**")
+                            if _leg.get('gold_driven_spike_flag'):
+                                st.warning("⚠️ Gold-driven spike — move may mean-revert faster than a fundamental crypto move.")
+                            st.caption(_leg['interpretation'])
+                        else:
+                            st.caption("Insufficient price history yet.")
 
-            st.markdown("**Silver / Crypto Tail Correlation**")
-            if _mtc.get('status') == 'ok':
-                c1, c2 = st.columns(2)
-                c1.metric("Silver vs BTC", f"{_mtc['silver_vs_btc']}")
-                c2.metric("Silver vs ETH", f"{_mtc['silver_vs_eth']}")
-                if _mtc.get('elevated_flag'):
-                    st.warning("⚠️ Elevated correlation — silver moving with crypto, not as an independent safe-haven.")
-                st.caption(_mtc['interpretation'])
-            else:
-                st.caption("Insufficient price history yet.")
+                st.markdown("**Silver / Crypto Tail Correlation**")
+                if _mtc.get('status') == 'ok':
+                    c1, c2 = st.columns(2)
+                    c1.metric("Silver vs BTC", f"{_mtc['silver_vs_btc']}")
+                    c2.metric("Silver vs ETH", f"{_mtc['silver_vs_eth']}")
+                    if _mtc.get('elevated_flag'):
+                        st.warning("⚠️ Elevated correlation — silver moving with crypto, not as an independent safe-haven.")
+                    st.caption(_mtc['interpretation'])
+                else:
+                    st.caption("Insufficient price history yet.")
+        except Exception as _mr_ex:
+            import logging as _mr_logging
+            _mr_logging.getLogger(__name__).warning(f"Metals Relationship section failed: {_mr_ex}")
+            st.caption("⚖️ Metals Relationship — temporarily unavailable.")
 
         # Capital Router — cycle-conditional DCA vs yield split (Kelly-derived)
         from signal_core import allocate_capital, expected_90d_return
