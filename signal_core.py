@@ -1099,6 +1099,29 @@ def cycle_top_readiness(state: dict) -> dict:
         and btc_g > 90 and eth_g > 90
     )
 
+    # Goal 2 manual confirmation gate — mirrors the carry_first_confirmed
+    # pattern. rotation_ready is pure percentile math; a rare, high-stakes,
+    # largely irreversible decision like crypto->metals rotation should not
+    # auto-execute on percentile alone, so a report never states Goal 2 as
+    # actionable-now until the user has explicitly confirmed via
+    # manage_state.py --confirm goal2-rotation.
+    goal2_confirmed = state.get('goal2_rotation_confirmed', False)
+    goal2_truly_ready = rotation_ready and goal2_confirmed
+
+    if rotation_ready and not goal2_confirmed:
+        goal2_status_note = (
+            'TRIGGER CONDITIONS MET but awaiting manual confirmation. '
+            'Run: python3 manage_state.py --confirm goal2-rotation '
+            'after reviewing GSR, ratio-decomposition, and tail-correlation '
+            'context in the weekly report. This is a rare, high-stakes, '
+            'largely irreversible decision — it does not auto-execute '
+            'on percentile alone.'
+        )
+    elif goal2_truly_ready:
+        goal2_status_note = 'CONFIRMED — proceed with rotation per sizing plan.'
+    else:
+        goal2_status_note = 'Dormant — trigger conditions not yet met.'
+
     # Sequencing directive
     if phase == 'ACCUMULATION':
         directive = 'HODL + DCA. No cycle-top actions. Debt is accretive leverage; metals rotation not warranted.'
@@ -1157,7 +1180,8 @@ def cycle_top_readiness(state: dict) -> dict:
         'goal2_metals_rotation': {
             'target': 'lock gains: crypto -> metals',
             'btc_gold_pct': btc_g, 'eth_gold_pct': eth_g,
-            'ready_to_execute': rotation_ready,
+            'ready_to_execute': goal2_truly_ready,
+            'status_note': goal2_status_note,
         },
         'sequencing': 'debt closure BEFORE metals rotation',
         'directive': directive,
@@ -1879,6 +1903,183 @@ def satellite_correlation(state: dict) -> dict:
             "vs_eth": round(corr_eth, 3) if corr_eth is not None else None,
         }
     return out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# METALS RELATIONSHIP SIGNALS — GSR, ratio-move decomposition, tail correlation
+#
+# Advisory context around the BTC/Gold + ETH/Gold dual rotation trigger
+# (rotation_trigger / metals_rotation_signal above). None of these gate
+# Goal 2 rotation on their own — the actual gate is the manual confirmation
+# flag in cycle_top_readiness (goal2_rotation_confirmed).
+# ────────────────────────────────────────────────────────────────────────────
+
+# Classic absolute GSR reference bands (cross-check only, not the primary signal)
+GSR_SILVER_CHEAP_ABS = 80.0   # above this, silver historically considered cheap vs gold
+GSR_GOLD_CHEAP_ABS = 50.0     # below this, gold historically considered cheap vs silver
+
+
+def gold_silver_ratio_signal(state: dict) -> dict:
+    """
+    Computes the Gold/Silver Ratio (GSR) as both a percentile (consistent
+    with the existing BTC/Gold, ETH/Gold framework) and an absolute level
+    cross-checked against classic reference bands. Advisory only — does
+    not gate any allocation or rotation decision on its own.
+
+    Rationale: GSR is one of the most established mean-reverting signals
+    in metals investing and is currently invisible to a framework that
+    only tracks BTC/Gold and ETH/Gold. Shown both ways because central
+    bank structural gold demand may be shifting gold's historical
+    distribution — a percentile computed against stale history could
+    disagree with the classic absolute bands, and that disagreement
+    itself is informative.
+    """
+    gold_usd = float(state.get('gold_usd', 0) or 0)
+    silver_usd = float(state.get('silver_usd', 0) or 0)
+    if gold_usd <= 0 or silver_usd <= 0:
+        return {'status': 'unavailable', 'reason': 'gold_usd or silver_usd missing'}
+
+    gsr = gold_usd / silver_usd
+
+    gold_hist = [p for _, p in state.get('gold_price_history', [])]
+    silver_hist = [p for _, p in state.get('silver_price_history', [])]
+    n = min(len(gold_hist), len(silver_hist))
+
+    gsr_percentile = None
+    if n >= 10:
+        gsr_series = [g / s for g, s in zip(gold_hist[-n:], silver_hist[-n:]) if s > 0]
+        if gsr_series:
+            below = sum(1 for x in gsr_series if x <= gsr)
+            gsr_percentile = round(below / len(gsr_series) * 100, 1)
+
+    absolute_read = (
+        'silver cheap vs gold' if gsr > GSR_SILVER_CHEAP_ABS else
+        'gold cheap vs silver' if gsr < GSR_GOLD_CHEAP_ABS else
+        'neutral zone'
+    )
+
+    return {
+        'status': 'ok',
+        'gsr': round(gsr, 2),
+        'gsr_percentile': gsr_percentile,
+        'gsr_percentile_note': (
+            f'{n} days of history' if n >= 10 else
+            f'insufficient history ({n}d, need 10+) — showing absolute read only'
+        ),
+        'absolute_read': absolute_read,
+        'absolute_bands': {'silver_cheap_above': GSR_SILVER_CHEAP_ABS,
+                            'gold_cheap_below': GSR_GOLD_CHEAP_ABS},
+        'caveat': (
+            'Central bank structural gold demand may be shifting the '
+            'historical distribution — treat percentile and absolute '
+            'read as two independent checks, not a single number. '
+            'Advisory only, does not gate Goal 2.'
+        ),
+    }
+
+
+def ratio_move_decomposition(state: dict, window_days: int = 14) -> dict:
+    """
+    For BTC/Gold and ETH/Gold, decomposes the trailing move into the
+    crypto-side contribution vs the gold-side contribution. Answers:
+    did this ratio move because crypto changed, or because gold changed?
+    These imply different forward reliability of the rotation signal —
+    a gold-driven spike (e.g. geopolitical shock) is more likely to
+    mean-revert than a crypto-driven fundamental move. Advisory only.
+    """
+    def pct_change(hist: list, window: int):
+        prices = [p for _, p in hist]
+        if len(prices) < window + 1:
+            return None
+        start, end = prices[-(window + 1)], prices[-1]
+        if start == 0:
+            return None
+        return (end - start) / start * 100
+
+    btc_chg = pct_change(state.get('btc_price_history', []), window_days)
+    eth_chg = pct_change(state.get('eth_price_history', []), window_days)
+    gold_chg = pct_change(state.get('gold_price_history', []), window_days)
+
+    def classify(crypto_chg, gold_chg):
+        if crypto_chg is None or gold_chg is None:
+            return {'status': 'insufficient_data'}
+        # Which leg contributed more to the ratio's move, in magnitude
+        dominant = 'crypto' if abs(crypto_chg) > abs(gold_chg) else 'gold'
+        # Flag the specific risk case: gold spiked while crypto was flat/down
+        gold_driven_spike = gold_chg > 5.0 and crypto_chg < gold_chg
+        return {
+            'status': 'ok',
+            'crypto_chg_pct': round(crypto_chg, 2),
+            'gold_chg_pct': round(gold_chg, 2),
+            'dominant_leg': dominant,
+            'gold_driven_spike_flag': gold_driven_spike,
+            'interpretation': (
+                'Ratio move primarily gold-driven — a geopolitical/rate '
+                'shock to gold may mean-revert faster than a fundamental '
+                'crypto move. Weight rotation signal with more caution.'
+                if gold_driven_spike else
+                f'Ratio move primarily {dominant}-driven over trailing {window_days}d.'
+            ),
+        }
+
+    return {
+        'window_days': window_days,
+        'btc_gold': classify(btc_chg, gold_chg),
+        'eth_gold': classify(eth_chg, gold_chg),
+        'note': 'Advisory only — informs interpretation, does not gate Goal 2.',
+    }
+
+
+def metals_tail_correlation(state: dict) -> dict:
+    """
+    Rolling correlation of silver vs BTC/ETH. Silver is more liquid and
+    higher-beta than gold and can fall alongside crypto in a genuine
+    forced-deleveraging event, which the dual BTC/Gold + ETH/Gold trigger
+    may not cleanly detect if silver moves with crypto rather than
+    holding like gold. Advisory only — a rising correlation is a flag
+    to interpret the rotation trigger more skeptically, not an override.
+    """
+    def pearson(x: list, y: list):
+        n = min(len(x), len(y))
+        if n < 10:
+            return None
+        x, y = x[-n:], y[-n:]
+        mx = sum(x) / n
+        my = sum(y) / n
+        num = sum((a - mx) * (b - my) for a, b in zip(x, y))
+        denx = sum((a - mx) ** 2 for a in x) ** 0.5
+        deny = sum((b - my) ** 2 for b in y) ** 0.5
+        if denx == 0 or deny == 0:
+            return None
+        return round(num / (denx * deny), 3)
+
+    silver_hist = [p for _, p in state.get('silver_price_history', [])]
+    btc_hist = [p for _, p in state.get('btc_price_history', [])]
+    eth_hist = [p for _, p in state.get('eth_price_history', [])]
+
+    if len(silver_hist) < 10:
+        return {'status': 'insufficient_data', 'n_points': len(silver_hist)}
+
+    corr_btc = pearson(silver_hist, btc_hist)
+    corr_eth = pearson(silver_hist, eth_hist)
+    max_corr = max(abs(corr_btc or 0), abs(corr_eth or 0))
+
+    return {
+        'status': 'ok',
+        'silver_vs_btc': corr_btc,
+        'silver_vs_eth': corr_eth,
+        'elevated_flag': max_corr > 0.5,
+        'interpretation': (
+            'Silver moving with crypto, not as an independent safe-haven — '
+            'a rotation signal here may not deliver the diversification '
+            'the framework assumes. Weight gold more heavily than silver '
+            'in any rotation while this holds.'
+            if max_corr > 0.5 else
+            'Silver behaving independently of crypto — rotation '
+            'diversification assumption holds.'
+        ),
+        'note': 'Advisory only — does not change the gold/silver split math automatically.',
+    }
 
 
 def supply_overhang(state: dict) -> dict:
