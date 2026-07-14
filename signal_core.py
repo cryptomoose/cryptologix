@@ -935,8 +935,18 @@ def wealth_compounding_objective(state: dict) -> dict:
     """
     portfolio = float(state.get('portfolio_usd', 0))
     cost_basis_total = float(state.get('total_contributions_usd', 0) or 0)
-    crypto_debt = (float(state.get('maker_debt_total_usd', 0) or 0) +
-                   float(state.get('aave_debt_usd', 0) or 0))
+    # Single source of truth for crypto debt: state["debt_unwind"]["total_crypto_debt_usd"]
+    # (signal_core.debt_unwind_optimizer). Falls back to summing maker/aave debt
+    # only when debt_unwind hasn't been computed yet (e.g. a standalone caller
+    # that doesn't run the full collector pipeline) — the collector always
+    # computes debt_unwind_optimizer first and passes it through state, so in
+    # normal operation this never recomputes independently.
+    _debt_unwind_state = state.get('debt_unwind')
+    if _debt_unwind_state and 'total_crypto_debt_usd' in _debt_unwind_state:
+        crypto_debt = float(_debt_unwind_state['total_crypto_debt_usd'])
+    else:
+        crypto_debt = (float(state.get('maker_debt_total_usd', 0) or 0) +
+                       float(state.get('aave_debt_usd', 0) or 0))
     debt_at_peak = float(state.get('crypto_debt_peak_usd', crypto_debt) or crypto_debt)
 
     # Compounding efficiency: NAV per dollar contributed
