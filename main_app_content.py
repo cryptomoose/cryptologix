@@ -289,9 +289,25 @@ def render_crypto_app():
         _weekly_dca_usd = recommendation.dca_amount_usd
 
         st.markdown("### 🚦 Capital Router")
+        # No live yield-opportunity feed is wired into cryptologix yet, so
+        # this call never passes yield_opportunities — allocate_capital's
+        # gating block (concentration_check / eligible_for_primary) only runs
+        # `if yield_usd > 0 and yield_opportunities`, meaning it silently
+        # returns the *theoretical* Kelly dca/yield split without ever
+        # checking real gates. yield_slots is still the correct ground truth
+        # for "did a protocol actually clear gates" (it's populated only by
+        # that gating block), so we reuse it here rather than trusting
+        # router['dca']/['yield_usd'] directly — when yield_slots is empty,
+        # 100% of capital goes to DCA, full stop; the theoretical split never
+        # actually deploys anywhere and must not be displayed as if it did.
         router = allocate_capital(_avg_cycle_pct, _weekly_dca_usd)
-        dca_usd = router["dca"]
-        yield_usd = router["yield_usd"]
+        yield_slots = router.get("yield_slots", [])
+        if yield_slots:
+            dca_usd = router["dca"]
+            yield_usd = router["yield_usd"]
+        else:
+            dca_usd = _weekly_dca_usd
+            yield_usd = 0.0
 
         r1, r2, r3 = st.columns(3)
         r1.metric("This week's capital", f"${_weekly_dca_usd:,.0f}")
@@ -299,13 +315,19 @@ def render_crypto_app():
         r3.metric("→ Yield deployment", f"${yield_usd:,.0f}")
 
         med, iqr = expected_90d_return(_avg_cycle_pct)
-        st.caption(
-            f"At the {_avg_cycle_pct:.1f}th percentile, {router['dca_frac']*100:.0f}% of new capital "
-            f"routes to DCA and {100 - router['dca_frac']*100:.0f}% to yield. "
-            f"Empirical E[90d return] here: {med*100:+.1f}% (IQR ±{iqr*100:.1f}%). "
-            "Split is Kelly-derived from E[90d DCA] vs E[90d yield] edge over the risk-free rate "
-            "(anchors: ~89% DCA at the 7th percentile down to yield-primary at the 65th+)."
-        )
+        if not yield_slots:
+            note = router.get("no_gate_cleared_note") or (
+                "Yield $0 — no protocol clears concentration + audit/TVL gates this week"
+            )
+            st.caption(f"⛔ {note} — 100% of new capital routes to DCA.")
+        else:
+            st.caption(
+                f"At the {_avg_cycle_pct:.1f}th percentile, {router['dca_frac']*100:.0f}% of new capital "
+                f"routes to DCA and {100 - router['dca_frac']*100:.0f}% to yield. "
+                f"Empirical E[90d return] here: {med*100:+.1f}% (IQR ±{iqr*100:.1f}%). "
+                "Split is Kelly-derived from E[90d DCA] vs E[90d yield] edge over the risk-free rate "
+                "(anchors: ~89% DCA at the 7th percentile down to yield-primary at the 65th+)."
+            )
         if router.get("profit_taking_review"):
             st.warning(
                 "⚠️ Cycle above the 50th percentile — review existing positions for "
@@ -366,23 +388,41 @@ def render_crypto_app():
             # Investment Allocation
             if recommendation.btc_amount_usd > 0 or recommendation.eth_amount_usd > 0:
                 st.markdown("#### 💰 Investment Breakdown")
-                
-                total_crypto_dca = recommendation.btc_amount_usd + recommendation.eth_amount_usd
-                btc_pct = (recommendation.btc_amount_usd / total_crypto_dca * 100) if total_crypto_dca > 0 else 0
-                eth_pct = (recommendation.eth_amount_usd / total_crypto_dca * 100) if total_crypto_dca > 0 else 0
-                
+
+                # Rescale BTC/ETH to the Capital Router's ACTUAL DCA base
+                # (dca_usd above), not recommendation.dca_amount_usd directly —
+                # those only agree when yield_slots is empty (100% to DCA);
+                # on a week a yield opportunity clears gates, dca_usd is the
+                # post-yield-carve-out figure and Investment Breakdown must
+                # reflect that same reduced base, not the pre-yield total.
+                _reco_dca = recommendation.dca_amount_usd
+                if _reco_dca > 0:
+                    _btc_weight = recommendation.btc_amount_usd / _reco_dca
+                    _eth_weight = recommendation.eth_amount_usd / _reco_dca
+                else:
+                    _btc_weight = _eth_weight = 0.0
+                btc_amount_usd = dca_usd * _btc_weight
+                eth_amount_usd = dca_usd * _eth_weight
+
+                total_crypto_dca = btc_amount_usd + eth_amount_usd
+                btc_pct = (btc_amount_usd / total_crypto_dca * 100) if total_crypto_dca > 0 else 0
+                eth_pct = (eth_amount_usd / total_crypto_dca * 100) if total_crypto_dca > 0 else 0
+
+                assert abs(total_crypto_dca - dca_usd) < 0.01, \
+                    "BTC+ETH allocation must equal the Capital Router's DCA amount"
+
                 base_dca = st.session_state.base_weekly_dca
                 multiplier = total_crypto_dca / base_dca if base_dca > 0 else 1.0
                 if abs(multiplier - 1.0) > 0.01:
                     st.info(f"This Week's Total: ${total_crypto_dca:,.2f} ({multiplier:.1f}x your ${base_dca:,.0f} baseline)")
                 else:
                     st.info(f"This Week's Total: ${total_crypto_dca:,.2f}")
-                
+
                 col_btc2, col_eth2 = st.columns(2)
                 with col_btc2:
-                    st.metric("Bitcoin (BTC)", f"${recommendation.btc_amount_usd:,.2f}", f"{btc_pct:.1f}% allocation")
+                    st.metric("Bitcoin (BTC)", f"${btc_amount_usd:,.2f}", f"{btc_pct:.1f}% allocation")
                 with col_eth2:
-                    st.metric("Ethereum (ETH)", f"${recommendation.eth_amount_usd:,.2f}", f"{eth_pct:.1f}% allocation")
+                    st.metric("Ethereum (ETH)", f"${eth_amount_usd:,.2f}", f"{eth_pct:.1f}% allocation")
                 
                 if 'date_range' in signals:
                     st.caption(f"📊 Historical Data: {signals.get('data_days', 0):,} days ({signals['date_range']})")
