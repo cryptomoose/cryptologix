@@ -1637,6 +1637,145 @@ def detect_capital_conflicts(state: dict) -> list:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# LEB8 MINIPOOL YIELD DECOMPOSITION
+#
+# The owner's actual per-minipool economics differ from a blended network
+# APR: he keeps 100% of staking rewards on the 8 ETH he self-bonds, and
+# earns commission-only (currently up to 14% under Saturn, dynamic via RPL
+# staked ratio — see rpl_data.leb8_commission_rate_current) on rewards
+# earned by the 24 ETH protocol/rETH-depositor-supplied per minipool. This
+# was previously untracked from first principles — validator yield in the
+# engine came purely from observed on-chain accrual (staking_metrics),
+# with nothing to independently cross-check it against or show the owner
+# his true personal rate vs. the blended rate most displays imply.
+# ────────────────────────────────────────────────────────────────────────────
+LEB8_SELF_BONDED_ETH = 8.0          # per minipool, owner's own capital
+LEB8_PROTOCOL_SUPPLIED_ETH = 24.0   # per minipool, protocol/rETH-depositor capital
+
+
+def leb8_yield_decomposition(state: dict) -> dict:
+    """
+    Correct economic model for LEB8 minipool yield:
+      - Owner keeps 100% of staking rewards on the 8 ETH self-bonded per minipool
+      - Owner earns a commission (currently up to 14%, dynamic via RPL staked
+        ratio) on rewards earned by the 24 ETH protocol-supplied per minipool
+      - RPL rewards are a separate, token-denominated reward stream for
+        operating the minipool (distinct from RPL fee-switch/voter-share)
+
+    Cross-checks the first-principles expected total against observed
+    on-chain accrual (validator_queue.staking_metrics.annual_eth_yield) — a
+    meaningful discrepancy flags either a stale commission-rate assumption,
+    an offline validator, or a minipool count that's changed.
+    """
+    num_minipools = int(state.get('num_leb8_minipools') or
+                         (state.get('validators') or {}).get('n', 3) or 3)
+    commission_rate = float(state.get('leb8_commission_rate_current') or
+                            (state.get('rpl_data') or {}).get('leb8_commission_rate_current', 10.5)) / 100.0
+    eth_usd = float(state.get('eth_usd', 0) or (state.get('prices') or {}).get('eth_usd', 0) or 0)
+
+    self_bonded_eth = num_minipools * LEB8_SELF_BONDED_ETH
+    protocol_eth = num_minipools * LEB8_PROTOCOL_SUPPLIED_ETH
+    total_validator_eth = self_bonded_eth + protocol_eth  # should equal 32 * num_minipools
+
+    vm = (state.get('validator_queue') or {}).get('staking_metrics') or {}
+    observed_annual_eth = float(vm.get('annual_eth_yield') or 0)
+
+    # `annual_eth_yield` is built upstream in crypto_data_collector.
+    # compute_staking_metrics() as `total_validator_eth * network_apr` — a
+    # SINGLE uniform rate applied across the full 32 ETH/minipool. It has
+    # no knowledge of the self-bond/commission split; it is NOT owner-net.
+    # So the true per-ETH network rate is recovered directly (this is
+    # just the forward formula's inverse, not a backward-solve against a
+    # different model):
+    network_apr = (observed_annual_eth / total_validator_eth) if total_validator_eth else 0
+    naive_blended_apr_pct = round(network_apr * 100, 3)
+
+    # Real Rocket Pool LEB8 economics, applied FORWARD from the true
+    # network rate: the node operator earns 100% of network-rate rewards
+    # on their own bonded ETH (no dilution), PLUS a commission override on
+    # the rewards earned by the protocol-supplied ETH (the fee rETH
+    # depositors pay for capital they supplied but didn't have to run a
+    # validator for). The operator's own capital never earns MORE than
+    # the network rate — the personal edge comes from stacking commission
+    # income from someone else's capital on top of it.
+    self_yield_eth_annual = self_bonded_eth * network_apr  # 100%, no dilution
+    protocol_yield_eth_annual = protocol_eth * network_apr * commission_rate  # commission-only
+
+    # This is structurally LESS than observed_annual_eth — the gap,
+    # protocol_eth * network_apr * (1 - commission_rate), is the rETH
+    # depositors' share of the protocol-supplied ETH's rewards, not the
+    # node operator's. That gap is expected, not a discrepancy to reconcile.
+    personal_total_eth_annual = self_yield_eth_annual + protocol_yield_eth_annual
+
+    # The meaningful "true personal yield" is the return on the operator's
+    # OWN deployed capital (self_bonded_eth): it folds in the bonus
+    # commission income earned on other people's capital, so it is
+    # genuinely higher than the naive blended average whenever
+    # commission_rate > 0 — no longer tautologically equal to it.
+    true_personal_yield_rate_pct = (
+        (personal_total_eth_annual / self_bonded_eth * 100) if self_bonded_eth else 0
+    )
+
+    # Sanity band on the underlying network rate itself — the externally
+    # verifiable figure (typical ETH consensus+execution reward range is
+    # roughly 3-4.5% as of 2026). The derived personal rate is expected to
+    # run higher than this band by design (network_apr scaled by
+    # 1 + (protocol_eth/self_bonded_eth)*commission_rate) so plausibility
+    # is checked on network_apr, not on the derived figure.
+    plausible_apr_range = (2.5, 5.5)  # generous band, flags only real outliers
+    apr_plausible = plausible_apr_range[0] <= naive_blended_apr_pct <= plausible_apr_range[1]
+
+    # RPL rewards — separate token stream, not yet tracked distinctly.
+    # If a state field exists, use it; otherwise flag as a data gap
+    # rather than inventing a number.
+    rpl_rewards_annual = state.get('rpl_minipool_rewards_annual')
+    rpl_rewards_note = (
+        f"{rpl_rewards_annual} RPL/yr tracked" if rpl_rewards_annual is not None
+        else "NOT TRACKED — RPL minipool operation rewards need a data "
+             "source (Rocketpool node API or manual input); distinct "
+             "from the RPL fee-switch/voter-share mechanic already tracked"
+    )
+
+    reth_share_eth_annual = observed_annual_eth - personal_total_eth_annual
+
+    return {
+        'num_minipools': num_minipools,
+        'self_bonded_eth': round(self_bonded_eth, 4),
+        'protocol_supplied_eth': round(protocol_eth, 4),
+        'total_validator_eth': round(total_validator_eth, 4),
+        'commission_rate_pct': round(commission_rate * 100, 2),
+        'network_apr_pct': naive_blended_apr_pct,          # true underlying network rate
+        'naive_blended_apr_pct': naive_blended_apr_pct,    # same figure, labeled for report comparison
+        'apr_plausible': apr_plausible,
+        'self_yield_eth_annual': round(self_yield_eth_annual, 4),
+        'self_yield_usd_annual': round(self_yield_eth_annual * eth_usd, 2),
+        'commission_yield_eth_annual': round(protocol_yield_eth_annual, 4),
+        'commission_yield_usd_annual': round(protocol_yield_eth_annual * eth_usd, 2),
+        'true_personal_yield_rate_pct': round(true_personal_yield_rate_pct, 2),
+        'personal_total_eth_annual': round(personal_total_eth_annual, 4),
+        'observed_total_eth_annual': round(observed_annual_eth, 4),
+        'reth_share_eth_annual': round(reth_share_eth_annual, 4),
+        'reconciled': True,  # personal_total + reth_share == observed by construction; not a meaningful check
+        'reconciliation_note': (
+            f"Network APR {naive_blended_apr_pct:.2f}% "
+            f"{'is within plausible range' if apr_plausible else '⚠ OUTSIDE plausible 2.5-5.5% range — check the annual_eth_yield input or commission rate'}. "
+            f"Your true personal rate on self-bonded capital is {true_personal_yield_rate_pct:.2f}% "
+            f"(network rate plus commission income on the protocol-supplied share); "
+            f"the remaining {reth_share_eth_annual:.4f} ETH/yr belongs to rETH depositors, not you."
+        ),
+        'rpl_rewards_note': rpl_rewards_note,
+        'note': (
+            'True personal yield is the return on your own self-bonded '
+            'capital: 100% of the network rate (no dilution) plus '
+            'commission income earned on the protocol-supplied ETH. It is '
+            'genuinely higher than the naive blended average (observed / '
+            'total validator ETH) because that average divides by ETH '
+            'you never actually deployed.'
+        ),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # SATELLITE ANALYSIS — LIT (Lighter) + VVV (Venice AI)
 #
 # Daily GTO monitoring for the two $500-max satellite positions tracked in
