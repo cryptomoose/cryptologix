@@ -1922,6 +1922,128 @@ def satellite_analysis(state: dict) -> dict:
     return {"lit": lit, "vvv": vvv}
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# MANUAL DCA RATIO TRACKER — SOL / NEAR / RPL daily buys
+#
+# Tracking/guidance only — these are owner-executed manual daily buys, not
+# Kraken-automated (unlike the core BTC/ETH/SOL DCA legs tracked by
+# dca_health above). Distinct from satellite_analysis (LIT/VVV, $500-cap
+# speculative GTO positions) — SOL/RPL here are core-conviction holdings
+# with fixed baseline daily $, not satellite bets.
+#
+# Owner-confirmed starting baseline: SOL $22.22/day, NEAR $17.17/day,
+# RPL $11.11/day ($50.50/day total, ~44.0% / 34.0% / 22.0%). SOL and RPL
+# stay fixed at that baseline. NEAR flexes with its entry tier (cheaper
+# price = buy more) — tier bands are owner-confirmed price levels, not
+# derived from any signal_core percentile/vol model:
+#   Tier 1 (baseline, 1.0x): NEAR < $3.50
+#   Tier 2 (~2.0x):          NEAR < $2.50
+#   Tier 3 (~3.3x):          NEAR < $1.75
+# Above $3.50 there is no tier (None) — hold at baseline 1.0x.
+# ────────────────────────────────────────────────────────────────────────────
+MANUAL_DCA_BASELINE = {
+    'sol': 22.22,
+    'near': 17.17,
+    'rpl': 11.11,
+}
+
+NEAR_ENTRY_TIERS = [
+    (3.50, 1),
+    (2.50, 2),
+    (1.75, 3),
+]
+
+NEAR_TIER_MULTIPLIER = {
+    1: 1.0,
+    2: 2.0,
+    3: 3.3,
+    None: 1.0,  # price at/above $3.50 — no tier, hold at baseline
+}
+
+
+def _near_entry_tier(near_price: float) -> dict:
+    """NEAR entry tier from live price. Tiers are owner-confirmed price
+    bands (see module note above), checked cheapest-first so a price that
+    clears multiple thresholds lands in the deepest (highest-multiplier)
+    tier. Returns active_tier=None above the Tier 1 threshold ($3.50)."""
+    price = float(near_price or 0)
+    active_tier = None
+    for threshold, tier in sorted(NEAR_ENTRY_TIERS, key=lambda t: t[1], reverse=True):
+        if price and price < threshold:
+            active_tier = tier
+            break
+    return {
+        'price': price,
+        'active_tier': active_tier,
+        'tier_thresholds': {t: thresh for thresh, t in NEAR_ENTRY_TIERS},
+    }
+
+
+def manual_dca_tracker(state: dict) -> dict:
+    """
+    Tracks the manual daily SOL/NEAR/RPL DCA split against the owner's
+    confirmed baseline ratio. NEAR's recommended $ flexes with its current
+    entry tier (_near_entry_tier); SOL and RPL are fixed baselines,
+    reflecting their relative conviction (SOL highest, RPL lowest,
+    established via manual review — not a percentile-derived signal).
+    This is a tracking/guidance display only — buys are manual, not
+    automated by this engine (contrast dca_health, which monitors the
+    Kraken-automated BTC/ETH/SOL core DCA legs).
+    """
+    prices = state.get('prices') or {}
+    near_price = state.get('near_usd')
+    if near_price is None:
+        near_price = prices.get('near_usd', 0)
+    near_tier = _near_entry_tier(near_price)
+    active_tier = near_tier['active_tier']
+    tier_mult = NEAR_TIER_MULTIPLIER.get(active_tier, 1.0)
+
+    baseline = MANUAL_DCA_BASELINE
+    recommended = {
+        'sol': baseline['sol'],
+        'near': round(baseline['near'] * tier_mult, 2),
+        'rpl': baseline['rpl'],
+    }
+    recommended_total = sum(recommended.values())
+
+    actual = state.get('manual_dca_actual', dict(baseline))
+    actual_total = sum(actual.values())
+
+    def pct(v, total):
+        return round(v / total * 100, 1) if total else 0
+
+    drift_flags = []
+    for asset in ('sol', 'near', 'rpl'):
+        if actual_total and recommended_total:
+            actual_pct = pct(actual[asset], actual_total)
+            rec_pct = pct(recommended[asset], recommended_total)
+            if abs(actual_pct - rec_pct) > 10:  # >10pp drift worth flagging
+                drift_flags.append(
+                    f"{asset.upper()}: actual {actual_pct}% vs recommended {rec_pct}% "
+                    f"({'over' if actual_pct > rec_pct else 'under'}-allocated)"
+                )
+
+    return {
+        'baseline': baseline,
+        'near_price': near_tier['price'],
+        'near_active_tier': active_tier,
+        'near_tier_multiplier': tier_mult,
+        'recommended_daily': recommended,
+        'recommended_total': round(recommended_total, 2),
+        'recommended_ratio_pct': {k: pct(v, recommended_total) for k, v in recommended.items()},
+        'actual_daily': actual,
+        'actual_total': round(actual_total, 2),
+        'actual_ratio_pct': {k: pct(v, actual_total) for k, v in actual.items()},
+        'drift_flags': drift_flags,
+        'note': (
+            "SOL/RPL are fixed conviction-weighted baselines (SOL highest "
+            "conviction of the three; RPL lowest). NEAR flexes with entry "
+            "tier: 1x above $3.50, ~2x below $2.50, ~3.3x below $1.75. "
+            "Manual buys — this engine tracks and recommends, does not execute."
+        ),
+    }
+
+
 def leverage_stress_test(state: dict) -> dict:
     """Read-only ETH price-shock stress test across every ETH-collateralized
     debt position (Aave + Maker vaults 30698/31944). Debt on all three is
